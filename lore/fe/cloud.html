@@ -1,0 +1,1200 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <link rel="stylesheet" type="text/css" href="./styles.css">
+    <script src='./lib.js' language=javascript></script>
+    <script src='./rad.js' language=javascript></script>
+    <script src='./control.js' language=javascript></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"> </script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@latest"> </script>
+</html>
+<body style='background-color: #000000; color: #c3c3c3; font-size: 12pt'>
+
+<!-- <fl xWatch=handle>#handle</fl>
+<fr xCmd='window.close()'>close</fr> -->
+<cl></cl>
+<div xWatch=cloud xLoop=cloud xKey=k xVal=v>
+    <fl><img xTest='isImage("#[v]")' width=100 height=100 xSrc='file://#[v]' alt=''><div xTest='!isImage("#[v]")' style='min-width: 100px; min-height: 100px'>#[v]</div></fl>
+</div>
+
+<cl></cl>
+
+<templates>
+
+    <div xTemplate=field>
+    
+    <div class=line style='vertical-align: top' xStyle='width: #titlewidth'>#title</div>
+    <div class=line><input type=text xName=#name xValue=#value xStyle='width: #valuewidth'></div>
+    
+    </div>
+    <div xTemplate=value>
+    
+    <div class=line style='vertical-align: top' xStyle='width: #titlewidth'>#title</div>
+    <div class=line xStyle='max-width: #valuewidth'>#value</div>
+    
+    </div>
+    <div xTemplate=passfield>
+    
+    <div class=line style='vertical-align: top' xStyle='width: #titlewidth'>#title</div>
+    <div class=line><input type=password xName=#name xValue=#value xStyle='width: #valuewidth'></div>
+    
+    </div>
+    <div xTemplate=areafield>
+    
+    <div class=line style='vertical-align: top' xStyle='width: #titlewidth'>#title</div>
+    <div class=cl></div>
+    <div class=line><textarea xName=#name xStyle='width: #width; height: #height' xrows=#rows xcolumns=#cols></textarea></div>
+    <div class=cl></div>
+    
+    </div>
+    <div xTemplate=selectfield>
+    
+    <div class=line style='vertical-align: top' xStyle='width: #titlewidth'>#title</div>
+    <div class=line><select xName=#name xMultiple=#multiple size=#size xStyle='width: #valuewidth' xLoop=#options xKey=k xVal=v>
+    <option xValue='#k'>#v</option>
+    </select></div>
+    
+    </div>
+    <div xTemplate=optionsfield>
+    
+    <div class=line style='vertical-align: top' xStyle='width: #titlewidth'>#title</div>
+    <div class=line><select xName=#name xOptions=#options xMultiple=#multiple xsize=#size xStyle='width: #valuewidth'>
+    </select></div>
+    
+    </div>
+    
+    <div xTemplate=window>
+    <div xId='win#.wid' style='border: 1px solid white; background: black; color: white; position: absolute' xStyle='left: #.x; top: #.y; z-index: #.z'>
+    <div xId='dragger#.wid' style='float: left; width: 100%' xDrag='xy' xDragTarget='win#.wid'
+        xDragSet='setWindowXY(rad_dragel, "#[.wid]", x, y)'>
+    <div xCmd='delWindow("#.wid")' style='float: right'>
+        X
+    </div>
+    <cl></cl>
+    </div>
+    <cl></cl>
+    
+    <div xSet='cast=#.cast,path=#.path,maxwidth=#.maxwidth,maxheight=#.maxheight'>
+    <div xRoot="#path">
+    <fl xCast='#cast' xRoot="#path" style='overflow: auto' xStyle='max-width: #maxwidth; max-height: #maxheight; width: #maxwidth; height: #maxheight'></fl>
+    </div>
+    </div>
+    
+    </div>
+    </div>
+    
+    </templates>
+    
+    <script language=javascript>
+    var winW=-1;
+    var winH=-1;
+    var startfuncs = new Array(), resizefuncs = new Array(), kbupfuncs = [], kbfuncs2 = [], kbfuncs = new Array(), loadedfuncs = new Array();
+    var startxfuncs = new Array(), resizexfuncs = new Array();
+    var clickfuncs = new Array();
+    var has_started=false;
+    var radlib_radicle = {
+        'fbtn': { 'onclick': 'formsend(this)', 'style': 'float: left; cursor: pointer; border: 1px solid #c3c3c3; border-radius: 2px' },
+        'formbtn': { 'onclick': 'formsend(this)', 'style': 'float: left; cursor: pointer; border: 1px solid #c3c3c3; border-radius: 2px' },
+        'btn': { 'style': 'float: left; cursor: pointer; border: 1px solid #c3c3c3; border-radius: 2px' },
+        'templates': { 'style': 'display: none', 'keepscan': 1 },
+        'submit': { 'onclick': 'fsend(this)', 'style': 'cursor: pointer; float: left; border: 1px solid #c3c3c3; border-radius: 2px' },
+        'value': { 'xCast': 'value', 'titlewidth': 200 },
+        'field': { 'xCast': 'field', 'valuewidth': 100, 'titlewidth': 200, 'style': 'float: left; clear: left' },
+        'passfield': { 'xCast': 'passfield', 'valuewidth': 100, 'titlewidth': 200, 'style': 'float: left; clear: left' },
+        'areafield': { 'xCast': 'areafield', 'valuewidth': 100, 'titlewidth': 200, 'style': 'float: left; clear: left' },
+        'optionsfield': { 'xCast': 'optionsfield', 'valuewidth': 100, 'titlewidth': 200, 'style': 'float: left; clear: left' },
+        'selectfield': { 'xCast': 'selectfield', 'valuewidth': 100, 'titlewidth': 200, 'style': 'float: left; clear: left' },
+        'fl': { 'class': 'fl' },
+        'fr': { 'class': 'fr' },
+        'cl': { 'class': 'cl', 'style': 'float: left; clear: both' },
+    
+        'main': { 'xPostDraw2': 'mainLoaded',
+            'keepscan': 1,
+            'id': 'mainscroll', 'className': 'margin-small',
+            //'xPostDraw': 'omv(["page","top","center"],1,250,1,40)',
+            'style': 'overflow:auto; float: right; padding-left: 5px; min-width: 400px',
+            'xStyle': 'width: winW-222; height: winH'
+        //'xWatch': 'window'
+        },
+        'view': {
+            'xSrc': '#src',
+            'xWatch2': '#src'
+        },
+        'zenbox': {
+            'id': 'zenbox',
+            'style': 'display: none'
+        },
+        'centerWidth': { 'xPostDraw3': 'function(e){ e.style.left = (winW-e.clientWidth)/2 + "px"; }' },
+        'centerHeight': { 'xPostDraw3': 'function(e){ e.style.top = (winW-e.clientHeight)/2 + "px"; }' },
+    
+        /*
+        'tabhead': { 'onclick': 'structTabHeadClick(this)', 'style': 'cursor: pointer' },
+        'tablist': { 'xPostDraw': 'structTabListLoaded' },
+        'tabsection': {},
+        'tabbody': {},
+    
+        'folderhead': { 'onclick': 'structFolderHeadClick(this)', 'style': 'cursor: pointer' },
+        'folder': { 'style': 'display: none', 'keepscan': 1 },
+        'foldee': { 'style': 'display: block' },
+    
+        'menu': { 'xDraw': 'structMenuDraw' }
+        */
+    };
+    
+    function radlibStartup()
+    {
+        radClass(radlib_radicle);
+    }
+    registerStartup(radlibStartup);
+    
+    function mainLoaded(dv)
+    {
+        //! adjust to screen-center
+    }
+    
+    
+    function bgAlpha( div, alpha )
+    {
+        var oldcolor = getStyle(div, 'backgroundColor');
+        var i, j;
+        if( oldcolor.split(",").length < 4 ) {
+            i = oldcolor.lastIndexOf(")");
+            j = 3;
+        } else {
+            var i = oldcolor.lastIndexOf(",");
+            j = 4;
+        }
+        var newcolor = "rgba" + oldcolor.substr(j,i-j)  + ", " + alpha + ")";
+        div.style.backgroundColor = newcolor;
+    }
+    
+    
+    function oFilter( obj, method )
+    {
+        var i;
+        var no = {};
+        for( i in obj ) {
+            if( method( obj[i] ) ) no[i]=obj[i];
+        }
+        return no;
+    }
+    function aIndexOf( aa, x )
+    {
+        for( var i in aa ) {
+            if( aa[i] == x ) return i;
+        }
+        return false;
+    }
+    function chrCount( astr, scanstr )
+    {
+        var i=0, n=0;
+    
+        while( (i=astr.indexOf(scanstr,i)) != -1 ) {
+            n++;
+            i++;
+        }
+        return n;
+    }
+    function quickSplit(astr,delim,replacer)
+    {
+        var i, ax;
+        var gre = new RegExp(replacer,'g');
+    
+        if( astr == "" || typeof astr == 'undefined' ) return [];
+        ax = astr.split(delim);
+        for( i=0; i<ax.length; i++ ) {
+            ax[i] = str_replace(gre,delim,ax[i]);
+        }
+        return ax;
+    }
+    function quickJoin(ax,delim,replacer)
+    {
+        var i, astr="";
+        var gre = new RegExp(delim,'g');
+    
+        if( typeof ax == 'undefined' || typeof ax.length == 'undefined' || ax.length <= 0 ) return "";
+        for( i=0; i<ax.length; i++ ) {
+            if( !isValid(ax[i]) )
+                continue;
+                //throw "join error: empty string";
+            if( astr!="" ) astr += delim;
+            astr += str_replace(gre,replacer,ax[i]);
+        }
+        return astr;
+    }
+    
+    
+    function joinNest( xn )
+    {
+        var i,str="";
+    
+        for(i=0;i<xn.length;i++){
+            if( i != 0 ) str += ",";
+            val = mReplace( joinImpNest(xn[i]), nest_escapes, nest_codes );
+            str += (val===""?"_":val);
+        }
+        return "!" + str;
+    }
+    function joinImpNest( xn )
+    {
+        if( xn == null ) return "";
+        if( typeof xn.length != 'undefined' )
+            return joinNest( xn );
+        if( typeof xn != 'object' ) {
+            return mReplace( xn, nest_escapes, nest_codes );
+        }
+    
+        var i, str = "", val;
+    
+        for( i in xn ) {
+            if( str !== "" ) str += ",";
+            str += mReplace( i, nest_escapes, nest_codes ) + "=";
+            val = mReplace( joinImpNest(xn[i]), nest_escapes, nest_codes );
+            str += val===""?"_":val;
+        }
+        return "@" + str;
+    }
+    
+    function splitNest( str )
+    {
+        if( str.substr(0,1) == "!" )
+            str = str.substr(1);
+    
+        var i, arr = [], src = str.split(/,/);
+    
+        for( i=0; i<src.length; i++ ) {
+            if( src[i] === "" ) continue;
+            val = splitImpNest( mReplace(src[i],nest_codes,nest_escapes) );
+            arr.push( val === "_" ? "" : val );
+        }
+    
+        return arr;
+    }
+    function splitImpNest( str )
+    {
+        var c = str.substr(0,1);
+        if( c == "@" )
+            str = str.substr(1);
+        else if( c == "!" && str.indexOf(",") === false ) // scalar
+            return mReplace( str.substr(1), nest_codes, nest_escapes );
+        if( c == "!" || str.indexOf("=") === false ) // array
+            return splitNest( str.substr(1) );
+    
+        var i, obj = {}, src = str.split(/,/);
+        var vxo, vkey, vval;
+    
+        for( i=0; i<src.length; i++ ) {
+            if( src[i] === "" ) continue;
+    
+            vxo = src[i].split(/=/);
+            vkey = mReplace( vxo[0], nest_codes, nest_escapes );
+            vval = splitImpNest( mReplace( vxo[1], nest_codes, nest_escapes ) ); //stringTranslate( $tx_safe_codes, $tx_safe_escapes, $vxo[1], 0 );
+            obj[vkey] = (vval==="_"?"":vval);
+        }
+        return obj;
+    }
+    
+    
+    
+    function htmlesc(str)
+    {
+        return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    
+    function esc(str)
+    {
+        return encodeURIComponent(str);
+    }
+    
+    function quoteesc(str)
+    {
+        return str.replace(/\"/g, '\\"');
+    }
+    function squoteesc(str)
+    {
+        if( typeof str != 'string' ) return str;
+        return str.replace(/\'/g, "&#39;");
+    }
+    
+    
+    function fmtTime(dt)
+    {
+        var hr, min, ampm;
+    
+        if( typeof dt == 'number' ) {
+            dt = new Date(dt);
+        }
+    
+        hr = dt.getHours();
+        min = dt.getMinutes();
+    
+        ampm = "am";
+    
+        if( min < 10 ) min = "0" + min;
+        if( hr >= 12 ) { ampm = "pm"; hr -= 12; }
+        if( hr == 0 ) hr = 12;
+    
+        return hr + ":" + min + ampm;
+    }
+    function fmtDate(dt)
+    {
+        var day, month;
+    
+        day = dt.getDay();
+        month = dt.getMonth();
+    
+        return fmtDay(day) + " " + fmtMonth(month) + " " + dt.getDate();
+    }
+    function fmtDay(dt)
+    {
+        if( dt == 0 ) return "Mon";
+        if( dt == 1 ) return "Tue";
+        if( dt == 2 ) return "Wed";
+        if( dt == 3 ) return "Thu";
+        if( dt == 4 ) return "Fri";
+        if( dt == 5 ) return "Sat";
+        if( dt == 6 ) return "Sun";
+    }
+    function fmtMon(mn)
+    {
+        if( mn == 0 ) return "Jan";
+        if( mn == 1 ) return "Feb";
+        if( mn == 2 ) return "Mar";
+        if( mn == 3 ) return "Apr";
+        if( mn == 4 ) return "May";
+        if( mn == 5 ) return "Jun";
+        if( mn == 6 ) return "Jul";
+        if( mn == 7 ) return "Aug";
+        if( mn == 8 ) return "Sep";
+        if( mn == 9 ) return "Oct";
+        if( mn == 10 ) return "Nov";
+        if( mn == 11 ) return "Dec";
+    }
+    function fmtMonth(mn)
+    {
+        if( mn == 0 ) return "January";
+        if( mn == 1 ) return "February";
+        if( mn == 2 ) return "March";
+        if( mn == 3 ) return "April";
+        if( mn == 4 ) return "May";
+        if( mn == 5 ) return "June";
+        if( mn == 6 ) return "July";
+        if( mn == 7 ) return "August";
+        if( mn == 8 ) return "September";
+        if( mn == 9 ) return "October";
+        if( mn == 10 ) return "November";
+        if( mn == 11 ) return "December";
+    }
+    function numSuffix(n)
+    {
+        if( n >= 4 && n <= 20 ) return "th";
+        if( n%10 == 1 ) return "st";
+        if( n%10 == 2 ) return "nd";
+        if( n%10 == 3 ) return "rd";
+        return "th";
+    }
+    function DateFormat(dt)
+    {
+        return dateFormat( dt.getTime() / 1000 );
+    }
+    function dateFormat(idt)
+    {
+        var xdate = new Date();
+        var xdt = xdate.getTime() / 1000;
+        var tm = xdt - idt;
+        if( tm < 30 ) {
+            return Math.round(tm) + " seconds ago";
+        } else if( tm < 60 ) {
+            return "less than a minute ago";
+        } else if( tm < 120 ) {
+            return "about a minute ago";
+        } else if( tm < 3600 ) {
+            return Math.round(tm/60) + " minutes ago";
+        } else if( tm < 5*86400 ) {
+            var pdate = new Date( idt*1000 );
+            if( pdate.getDate() == xdate.getDate() ) {
+                return fmtTime(pdate);
+            } else {
+                return fmtDay(pdate.getDay()) + " " + fmtTime(pdate);
+            }
+        } else {
+            var pdate = new Date( idt*1000 );
+            return fmtMon( pdate.getMonth() ) + " " + pdate.getDate() + numSuffix(pdate.getDate()) + ", " + fmtTime(pdate);
+        }
+        return "unknown";
+    }
+    function typeOf(value) {
+        var s = typeof value;
+        if (s === 'object') {
+            if (value) {
+                if (value instanceof Array) {
+                    s = 'array';
+                }
+            } else {
+                s = 'null';
+            }
+        }
+        return s;
+    }
+    function cloneObject2(obj) {
+        var clone;
+        var typ = this.typeOf(obj);
+        switch(typ){
+            case 'date':
+                clone = new Date();
+                clone.setTime(obj.getTime());
+                break;
+            case 'object':
+                clone={};
+                for( var i in obj )
+                {
+                    clone[i] = this.cloneObject(obj[i]);
+                }
+                break;
+            case 'array':
+                clone = obj.slice(0);
+                break;
+            case 'function':
+                clone = null;
+                break;
+            default:
+                if( typeof obj == 'undefined' )
+                    clone = undefined;
+                else {
+                intermed = JSON.stringify(obj);
+                clone = JSON.parse(intermed);
+                }
+                break;
+        }
+        return clone;
+    };
+    function cloneObject(obj)
+    {
+        var clone = {};
+    //  var x;
+        for( var i in obj )
+        {
+            switch(typeOf(obj[i])){
+                case 'object':
+                    clone[i] = cloneObject(obj[i]);
+                    break;
+                case 'array':
+                    clone[i] = obj[i].slice(0);
+                    break;
+                case 'null':
+                    break;
+                default:
+                    clone[i] = obj[i];
+                    break;
+            }
+        }
+        return clone;
+    }
+    
+    function aIndex(arr,key)
+    {
+        if( typeof arr == 'object' && typeof arr.indexOf == 'function' ) return arr.indexOf(key);
+        for( var i in arr ) {
+            if( arr[i] == key ) return i;
+        }
+        return -1;
+    }
+    function registerClick(fnc)
+    {
+        if( aIndex(clickfuncs, fnc) != -1 ) return;
+        clickfuncs.push(fnc);
+    }
+    
+    function unregClick(fnc)
+    {
+        var i = aIndex(clickfuncs, fnc);
+        if( i == -1 ) return;
+        clickfuncs.splice(i,1);
+    }
+    function registerStartup(fnc)
+    {
+        var i;
+        if( has_started ) fnc();
+        if( aIndex(startfuncs,fnc) != -1 ) return;
+        startfuncs.push(fnc);
+    }
+    function XRegisterStartup(xc)
+    {
+        if( has_started ) eval(xc);
+        if( aIndex(startxfuncs, xc) != -1 ) return;
+        startxfuncs.push(xc);
+    }
+    function registerLoaded(fnc)
+    {
+        if( aIndex(loadedfuncs, fnc) != -1 ) return;
+        if( has_started ) fnc();
+        loadedfuncs.push(fnc);
+    }
+    function XRegisterResize(xc)
+    {
+        if( aIndex(resizexfuncs, xc) != -1 ) return;
+        resizexfuncs.push(xc);
+    }
+    function registerResize(fnc)
+    {
+        if( aIndex(resizefuncs, fnc) != -1 ) return;
+        resizefuncs.push(fnc);
+    }
+    function unregResize(fnc)
+    {
+        var i = aIndex(resizefuncs, fnc);
+        if( i == -1 ) return;
+        resizefuncs.splice(i,1);
+    }
+    function registerKeyUp(fnc)
+    {
+        if( aIndex(kbupfuncs, fnc) != -1 ) return;
+        kbupfuncs.push(fnc);
+    }
+    function unregKeyUp(fnc)
+    {
+        var i = aIndex(kbupfuncs, fnc);
+        if( i == -1 ) return;
+        kbupfuncs.splice(i,1);
+    }
+    function registerKeyboard(fnc)
+    {
+        if( aIndex(kbfuncs, fnc) != -1 ) return;
+        kbfuncs.push(fnc);
+    }
+    function unregKeyboard(fnc)
+    {
+        var i = aIndex(kbfuncs, fnc);
+        if( i == -1 ) return;
+        kbfuncs.splice(i,1);
+    }
+    function registerKeyboard2(fnc)
+    {
+        if( aIndex(kbfuncs2, fnc) != -1 ) return;
+        kbfuncs2.push(fnc);
+    }
+    function unregKeyboard2(fnc)
+    {
+        var i = aIndex(kbfuncs2, fnc);
+        if( i == -1 ) return;
+        kbfuncs2.splice(i,1);
+    }
+    function endEvent(ev)
+    {
+        if( typeof ev.stopPropagation != 'undefined' ) ev.stopPropagation();
+        ev.cancelBubble = true;
+    }
+    document.onclick = function mouseClick()
+    {
+        var i,n=false;
+        for( i = 0; i < clickfuncs.length; i++ ) {
+            if( (n=clickfuncs[i]()) > 0 ) {
+                endEvent(window.event);
+                return true;
+            } else if( n < 0 ) {
+                return true;
+            } else if( n === 0 ) {
+                return false;
+            }
+        }
+    }
+    function windowStartup()
+    {
+        console.log("onload()");
+        has_started=true;
+        winSize(); // find window size
+        var i; // run callbacks
+        for( i = 0; i < startfuncs.length; i++ ) {
+            //try {
+                startfuncs[i]();
+            //} catch( e ) {
+    //          console.warn("Warning: Couldn't run sf " + i + ": " + e, startfuncs[i]);
+        //      }
+        }
+        for( i=0;i<startxfuncs.length;i++ ) {
+        //    try {
+                eval( startxfuncs[i] );
+            //} catch( e ) {
+    //        console.warn("Warning: Couldn't run sxf " + i + ": " + e, startxfuncs[i]);
+        //    }
+        }
+        setSize();
+        for( i = 0; i < loadedfuncs.length; i++ ) {
+            //try {
+            loadedfuncs[i]();
+            //} catch( e ) {
+    //        console.warn("Warning: Couldn't run lf " + i + ": " + e, loadedfuncs[i]);
+        //    }
+        }
+        console.log("onload--");
+        winStarted = true;
+    }
+    //window.onload = windowStartup;
+    //document.addEventListener( "DOMContentLoaded", domStartup, false );
+    window.addEventListener( "load", windowStartup, false );
+    
+    //  window.document.body.onload = windowStartup;
+    //};
+    window.onresize = function resetSize()
+    {
+        winSize(); // find new size
+        setSize(); // run callbacks
+    }
+    function setSize()
+    {
+        var i; // run resize callbacks (this is done for startup + resize events)
+        var xl=[];
+        for( i = 0; i < resizefuncs.length; i++ ) {
+            resizefuncs[i]();
+        }
+        for( i=0;i<resizexfuncs.length;i++ ) {
+            if( eval( resizexfuncs[i] ) == -1 ) {
+                xl.push(i);
+            }
+        }
+        var j;
+        for( j=xl.length-1; j>=0; j-- ) {
+            resizexfuncs.splice( xl[j], 1 );
+        }
+    }
+    document.onkeyup = function keyPress3(ev)
+    {
+        var new_h;
+    
+        var kc;
+        if (navigator.userAgent.indexOf('MSIE') !=-1) {
+            if( !ev ) ev = event;
+            kc = ev.keyCode;
+        } else {
+            kc = ev.which;
+        }
+    
+        if( document.keyup_reg ) {
+            return document.keyup_reg(kc);
+        }
+    
+        var i, o; // run keyboard callbacks until we get a hit
+        for( i = 0 ; i < kbupfuncs.length; i++ ) {
+            if( (o=kbupfuncs[i](kc,ev)) == 1 ) {
+    //          console.log("F");
+                return false;
+            } else if( o == -1 ) {
+    //          console.log("T");
+                return true;
+            } else if( o == -2 ) {
+                if( ev.preventDefault ) {
+                    ev.preventDefault();
+                }
+                if( ev.stopPropagation ) {
+                    ev.stopPropagation();
+                }
+            } // else continue.
+        }
+        if( kc == 27 || kc == 13 ) {
+            if( document.activeElement && document.activeElement.type == 'textarea' )
+                return true;
+            dbg("default fsend1");
+            if( typeof fcel != 'undefined' && fcel != null && fcel.onchange ) {
+                fcel.onchange();
+            }
+            fsend();
+            if( form_sent )
+                return cancelEv(ev);
+        }
+        return true; // default
+    }
+    document.onkeypress = function keyPress2(ev)
+    {
+        var new_h;
+    
+        var kc;
+        if (navigator.userAgent.indexOf('MSIE') !=-1) {
+            if( !ev ) ev = event;
+            kc = ev.keyCode;
+        } else {
+            kc = ev.which;
+        }
+    
+        if( document.keypress_reg ) {
+            return document.keypress_reg(kc);
+        }
+    
+        var i, o; // run keyboard callbacks until we get a hit
+        for( i = 0 ; i < kbfuncs2.length; i++ ) {
+            if( (o=kbfuncs2[i](kc,ev)) == 1 ) {
+    //          alert("F");
+                return false;
+            } else if( o == -1 ) {
+    //          alert("T");
+                return true;
+            } else if( o == -2 ) {
+                if( ev.preventDefault ) {
+                    ev.preventDefault();
+                }
+                if( ev.stopPropagation ) {
+                    ev.stopPropagation();
+                }
+            } // else continue.
+        }
+    //          alert("X");
+        if( kc == 27 || kc == 13 ) {
+            if( document.activeElement && document.activeElement.type == 'textarea' )
+                return true;
+            dbg("okp default fsend1");
+    //        if( typeof fcel != 'undefined' && fcel != null && fcel.onchange ) {
+    //            fcel.onchange();
+    //        }
+    //      fsend();
+    //      if( form_sent )
+                return cancelEv(ev);
+        }
+        return true; // default
+    }
+    document.onkeydown = function keyPress(ev)
+    {
+        var new_h;
+    
+        var kc;
+        if (navigator.userAgent.indexOf('MSIE') !=-1) {
+            if( !ev ) ev = event;
+            kc = ev.keyCode;
+        } else {
+            kc = ev.which;
+        }
+    
+        if( document.keydown_reg ) {
+            return document.keydown_reg(kc);
+        }
+    
+        var i, o; // run keyboard callbacks until we get a hit
+        for( i = 0 ; i < kbfuncs.length; i++ ) {
+            if( (o=kbfuncs[i](kc,ev)) == 1 ) {
+    //          alert("F");
+                return false;
+            } else if( o == -1 ) {
+    //          alert("T");
+                return true;
+            } else if( o == -2 ) {
+                if( ev.preventDefault ) {
+                    ev.preventDefault();
+                }
+                if( ev.stopPropagation ) {
+                    ev.stopPropagation();
+                }
+            } // else continue.
+        }
+    
+        if( kc == 27 || kc == 13 ) {
+            dbg("okd fsend1");
+            if( document.activeElement && document.activeElement.type == 'textarea' )
+                return true;
+    //        if( typeof fcel != 'undefined' && fcel != null && fcel.onchange ) {
+    //            fcel.onchange();
+    //        }
+    //      fsend();
+    //      if( form_sent )
+                return cancelEv(ev);
+        }
+        return true; // default
+    }
+    function cancelEv(ev)
+    {
+        ev.returnValue = false;
+        if( ev.preventDefault ) {
+            ev.preventDefault();
+        }
+        if( ev.stopPropagation ) {
+            ev.stopPropagation();
+        }
+        return false;
+    }
+    
+    function winSize()
+    {
+        if( typeof document.winW != 'undefined' ) {
+            winW = document.winW;
+            winH = document.winH;
+        } else if( typeof window.innerWidth != 'undefined' && window.innerWidth != 0 ) {
+            winW = window.innerWidth;
+            winH = window.innerHeight;
+        } else if( typeof document.body.clientWidth != 'undefined' && document.body.clientWidth != 0 ) {
+            winW = document.body.clientWidth;
+            winH = document.body.clientHeight;
+        } else {
+            winW = document.documentElement.clientWidth;
+            winH = document.documentElement.clientHeight;
+    //if( typeof window.screen != 'undefined' ) {
+    //      winW = window.screen.availWidth;
+    //      winH = window.screen.availHeight;
+    //  } else
+        }
+        if( radStore ) {
+            radStore("window.width", winW);
+            radStore("window.height", winH);
+        }
+    }
+    
+    
+    function mc(ev)
+    {
+        var ev = ev||window.event;
+        return( [ document.body.scrollLeft - document.body.clientLeft + ev.clientX,
+            document.body.scrollTop  - document.body.clientTop + ev.clientY ] );
+    }
+    
+    function matchAncestor( div, tests )
+    {
+        var dv = div.parentNode;
+        var i,v;
+    
+        while( dv ) {
+            for ( i in tests ) {
+                if( dv.hasAttribute(i) )
+                    v = dv.getAttribute(i);
+                else if( dv[i] )
+                    v = dv[i];
+                else continue;
+    
+                if( tests[i] === true )
+                    return dv;
+                if( typeof v != 'string' )
+                    continue;
+                if( aIndex(v, tests[i]) )
+                    return dv;
+            }
+            dv = dv.parentNode;
+        }
+        return null;
+    }
+    
+    
+    
+    
+    function randStr(len)
+    {
+        return str_rand(len);
+    }
+    function str_rand( len )
+    {
+            var chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXTZabcdefghiklmnopqrstuvwxyz";
+            var str = "";
+            for( var i=0;i<len;i++ ) {
+                str += chars.substr( Math.floor(Math.random()*chars.length), 1 );
+            }
+            return str;
+    }
+    function digi_rand( len )
+    {
+            var chars = "0123456789";
+            var str = "";
+            var has0 = false, c;
+            for( var i=0;i<len;i++ ) {
+                do
+                {
+                    c = chars.substr( Math.floor(Math.random()*chars.length), 1 );
+                    if( !has0 && c != '0') has0 = true;
+                } while( !has0 );
+                str += c;
+            }
+            return str;
+    }
+    
+    
+    
+    function getKeys( obj )
+    {
+        var lkeys=[];
+        var j=0;
+        for( var i in obj ) {
+            lkeys[j]=i;
+            j++;
+        }
+        lkeys.sort();
+        return lkeys;
+    }
+    function obj2Lists( obj, sh )
+    {
+        var build=[]; var j = 0
+            ;;for( var i in obj ) {
+                if( !obj[i] ) continue;
+                if( typeof obj[i].clone != 'undefined' ) build[j] = obj[i].clone();
+                    else build[j] = obj[i];
+                j ++ };;
+            return build;
+    }
+    function obj2List2( obj, sh )
+    {
+        var b=[];
+    
+        for( var i in obj ) {
+            if( !obj[i] ) continue;
+            if( typeof obj[i].clone != 'undefined' ) b.push(obj[i].clone());
+            else b.push(obj[i]);
+        }
+        return b;
+    }
+    function obj2List( obj, sh )
+    {
+        var build=[]; var j = 0
+            ;;for( var i in obj ) {
+                if( !obj[i] || typeof obj[i].clone != 'undefined' ) continue;
+                build[j] = obj[i];  j ++
+                    };;
+            return build;
+    }
+    function objectToList( obj )
+    {
+        var build=[];
+        var j=0;
+        for( var i in obj ) {
+            build[j] = i;
+            j++;
+        }
+        build.sort();
+        for( j=0;j<build.length;j++ ) {
+            build[j] = obj[ build[j] ];
+        }
+        return build;
+    }
+    function classSwap(div,srch,repl)
+    {
+        var newClass, wasFound=false;
+        if( !isValid(div) ) return wasFound; // || !isValid(div.className) ) return wasFound;
+        if( div.nodeName.toLowerCase().indexOf(srch.toLowerCase()) != -1 ) {
+            newClass = div.nodeName.toLowerCase().replace(srch.toLowerCase(),repl);
+            div.nodeName = newClass;
+            wasFound = true;
+        }
+        if( div.className.indexOf(srch)!=-1 ) {
+            newClass = div.className.replace(srch,repl);
+            div.className = newClass;
+            wasFound = true;
+        }
+        if( typeof div.attributes != 'undefined' ) {
+            for( var i = 0; i < div.attributes.length; ++i ) {
+                if( div.attributes[i].value == '' ) {
+                    if( div.attributes[i].name.indexOf(srch) != -1 ) {
+                        wasFound = true;
+                        newClass = div.attributes[i].name.replace(srch,repl);
+                        div.removeAttribute( div.attributes[i].name );
+                        i=0;
+                        div.setAttribute( newClass, '' );
+                    }
+                }
+            }
+        }
+        if( wasFound ) {
+            flagSized(div);
+            if( div.hasAttribute('xPostDraw') ) {
+                var x = div.getAttribute('xPostDraw');
+                x = radTransParm(x);
+                if( x.indexOf("(") != -1 ) {
+                    eval(x);
+                } else {
+                    var xfunc = eval( x );
+                    xfunc( div );
+                }
+            }
+        }
+        return wasFound;
+    }
+    
+    function setFloat(dv,val)
+    {
+        if( navigator.appName.indexOf("Internet Explorer") >= 0 ) {
+            dv.style.styleFloat = val;
+        } else {
+            dv.style.cssFloat = val;
+        }
+    }
+    
+    function str_replace( needle, magnet, haystack )
+    {
+        var x=0, lastx=0;
+        var vx = "";
+    
+        if( typeof haystack != 'string' ) return haystack;
+    
+        while( (x=haystack.indexOf(needle, x)) != -1 ) {
+            if( x != lastx ) {
+                vx += haystack.substr(lastx,x-lastx);
+            }
+            vx += magnet;
+            x = lastx = x+needle.length;
+        }
+        if( lastx < haystack.length )
+            vx += haystack.substr(lastx);
+        return vx;
+    }
+    
+    function str_tok( brkx, str, inclbr )
+    {
+        var i, j, x, lastx=0;
+        var c, cx;
+        var ox=[];
+    
+        if( typeof str != 'string' ) return str;
+        cx = [];
+        for(i=0;i<brkx.length;i++){
+            cx.push( brkx[i].charAt(0).toLowerCase() );
+        }
+    
+        for(i=0;i<str.length;i++){
+            c = str.charAt(i).toLowerCase();
+            for(j=0;j<brkx.length;j++){
+                if( c == cx[j] && str.substr(i,brkx[j].length).toLowerCase() == brkx[j].toLowerCase() ) {
+                    if( lastx < i-1 )
+                        ox.push( str.substr(lastx,i-lastx) );
+                    if( inclbr )
+                        ox.push( str.substr(i,brkx[j].length) );
+                    i += brkx[j].length-1;
+                    lastx=i+1;
+                    break;
+                }
+            }
+        }
+        if( lastx < i ) ox.push( str.substr(lastx) );
+        return ox;
+    }
+    
+    function shortString(maxLen, str)
+    {
+        if( typeof str != 'string' ) return '';
+        if( str.length <= maxLen ) return str;
+        return str.substr(0, maxLen-5) + '..' + str.substr( -3 );
+    }
+    
+    
+    var windows = [];
+    var windivs = [];
+    
+    function newWindowId()
+    {
+        var i;
+        do {
+        var n = randStr(8);
+        var found=false;
+        for( i=0; i<windows.length; ++i ) {
+            if( windows[i].wid == n ) {
+            found=true;
+            break;
+            }
+        }
+        if( !found ) return n;
+        } while(true);
+    }
+    function findWindowId(id)
+    {
+        var i;
+        for( i=0; i<windows.length; ++i ) {
+        if( windows[i].wid == id ) return i;
+        }
+        return false;
+    }
+    function checkWindowPos(n)
+    {
+        var i, found=false;
+        for( i=0; i<windows.length; ++i ) {
+        if( i == n ) continue;
+        if( windows[i].x == windows[n].x && windows[i].y == windows[n].y )
+        {
+            found=true;
+            break;
+        }
+        }
+        return found;
+    }
+    function newWindow( template, newroot, onclose=false, maxwidth=400, maxheight=400 )
+    {
+        var winobj = { 'cast': template, 'path': newroot, 'z': getWindowTopZ(windows.length), 'x': Math.floor((winW-maxwidth)/4), 'y': Math.floor((winH-maxheight)/2), 'wid': newWindowId(), 'onclose': onclose, 'maxwidth': maxwidth, 'maxheight': maxheight };
+        var winpath = windows.length;
+        windows.push(winobj);
+        console.log("New window z: " + winobj.z);
+        while( checkWindowPos(winpath) ) {
+        winobj.x += 32;
+        winobj.y += 32;
+        if( winobj.y + maxheight >= winH-30 ) {
+            winobj.y = Math.random() * ((winH-30)-maxheight);
+        }
+        if( winobj.x + maxwidth >= winW-30 ) {
+            winobj.x = Math.random() * ((winW-30)-maxwidth);
+        }
+        }
+        radStore("windows." + winobj.wid, winobj);
+        var e = genTemplate('window','windows.'+winobj.wid);
+        windivs.push(e);
+    
+        return winpath;
+    }
+    function delWindow( id )
+    {
+        var winpath = findWindowId(id);
+        if( winpath===false ) return;
+        if( windows[winpath].onclose ) {
+        try{
+            eval( windows[winpath].onclose );
+        } catch(e) {
+            console.log("delWindow onClose: " + e);
+        }
+        }
+        document.documentElement.removeChild( windivs[winpath] );
+        windows.splice(winpath,1);
+        windivs.splice(winpath,1);
+        radClear("windows." + id);
+    }
+    function getWindowTopZ(n)
+    {
+        var i;
+        var zlevel=10000;
+        for( i=0; i<windows.length; ++i ) {
+        if( i == n ) continue;
+        if( windows[i].z >= zlevel )
+            zlevel = windows[i].z+1;
+        }
+        return zlevel;
+    }
+    function setWindowXY( dragel, id, x, y )
+    {
+        var winpath = findWindowId(id);
+        if( winpath===false ) return;
+        //var winel = gE("win" + id);
+        //console.log("setWindowXY("+id+","+x+","+y+")");
+        windows[winpath].x = x;
+        windows[winpath].y = y;
+        windows[winpath].z = getWindowTopZ(winpath);
+        radStore("windows."+id,windows[winpath]);
+        radStyle( dragel );
+        //dragel.style.left = x + "px";
+    }
+    function windowToTop( id )
+    {
+        var winpath = findWindowId(id);
+        if( winpath===false ) return false;
+        var e = gE("win" + id);
+        windows[winpath].z = getWindowTopZ(winpath);
+        radStore("windows."+id,windows[winpath]);
+        radStyle(e);
+        return true;
+    }
+    
+    </script>
+<script language=javascript>
+    registerStartup(function(){
+        radLoad();
+        window.elect.receive('mycloud', function(data,handle) {
+            radStore("handle", handle);
+            radStore("cloud", data);
+        });
+        window.elect.getCloud();
+    });
+
+    function isImage(str)
+    {
+        if( str.indexOf(".jpg") != -1 || str.indexOf(".jpeg") != -1 || str.indexOf(".png") != -1 || str.indexOf(".gif") != -1 || str.indexOf(".bmp") != -1 )
+            return true;
+        return false;
+    }
+
+</script> 
+</body>
+</html>

@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <script src='./rad.js'></script>
+    <script src='./lib.js'></script>
+    <script src='./libtoo.js'></script>
+    <script src='./vst.js'></script>
+    <title>Realms of Lore</title>
+    <link rel="stylesheet" type="text/css" href="./styles.css">
+</html>
+<body style='background-color: #181120; color: #c3c3c3; font-size: 10pt'>
+
+<div id=scrollarea style='position: absolute; left: 0px; top: 0px; min-height: 48px; overflow: auto'>
+<div id=textlog style='max-width: 100%'></div>
+</div>
+
+<div id=busynode style='position: absolute; right: 5px; top: 5px' class='notbusy'>*</div>
+<div id=npast style='position: absolute; right: 10px; top: 8px'></div>
+
+<cl></cl>
+
+<div id=inputarea style='position: absolute; bottom: 0px; display: none' onsubmit="return nullEv(event);">
+<form name=form0 nomagic=true style='float: left'>
+    <div style='clear: both'>
+        <div style='float: left'>
+            <input type=checkbox name='autonomy' checked=false value=1 onchange='updateAutonomy()'>
+        </div><div style='float: left'>???</div>
+        <fl>Coins:</fl>
+        <fl>
+            <input type=text size=7 name=budget value=0 onchange='updateBudget()'>
+        </fl>
+        <fl>Speed:</fl>
+        <fl>
+            <input type=text size=5 name=speed onchange='updateSpeed()'>
+        </fl>
+        <fl>Scroll:</fl>
+        <fl><input type=checkbox name=scroll checked=true value=1></fl>
+        <fl id=status></fl>
+        <cl></cl>
+    </div>
+    <cl></cl>
+    <div style='float: left'>
+        <textarea id=typingbox disabled=true rows=4 style='width: 600px' onfocus='grabEnter()' onblur='releaseEnter()' name=data></textarea>
+    </div>
+    <div style='float: right'>
+        <button id=sendbutton onClick=generate()>Send</button>
+    </div>
+</form>
+</div>
+
+<cl></cl>
+    
+<script language=javascript>
+var winW, winH;
+
+var in_input = false;
+var m, mybudget, myautonomy;
+var myhist=[], current_history_element=0;
+
+function nullEv(e) {
+    e.preventDefault();
+    return false;
+}
+
+function startup() {
+    console.log("startup()");
+
+    var typer = document.getElementById('typingbox')
+    typer.addEventListener( "keypress", function(ev) {
+        if( ev.key == "Enter" ) {
+            if( !in_input ) return;
+            if( !ev.shiftKey ) {
+                ev.preventDefault();
+                document.getElementById('sendbutton').click();
+            }
+        }
+    });
+    typer.addEventListener( "keyup", function(ev) {
+        if( ev.key == "ArrowUp" ) {
+            if( !in_input ) return;
+            ev.preventDefault();
+            var t = document.forms.form0.typingbox;
+            if( t.value != "" ) {
+                myhist[current_history_element] = t.value;
+            }
+
+            current_history_element--;
+            if( current_history_element < 0 )
+                current_history_element = 0;
+            t.value = myhist[current_history_element];
+        } else if( ev.key == "ArrowDown" ) {
+            if( !in_input ) return;
+            ev.preventDefault();
+            var t = document.forms.form0.typingbox;
+            if( t.value != "" ) {
+                myhist[current_history_element] = t.value;
+            }
+            current_history_element++;
+            if( current_history_element >= myhist.length ) {
+                myhist.push("");
+            }
+            t.value = myhist[current_history_element];
+        }
+    });
+
+    document.forms.form0.budget.value = mybudget;
+    document.forms.form0.autonomy.checked = ( myautonomy != 0 );
+    document.forms.form0.speed.value = myautonomy;
+
+    window.elect.runQuery(m, "/startup");
+    document.forms['form0'].typingbox.focus();
+}
+function grabEnter() {
+    in_input=true;
+}
+function releaseEnter() {
+    in_input=false;
+}
+
+let in_budget=false;
+
+function updateAutonomy()
+{
+    if( in_budget ) return;
+
+    var go = document.forms.form0.autonomy.checked ? document.forms.form0.speed.value : 0;
+    window.elect.runQuery(m, "/auto " + parseInt(go));
+}
+function updateBudget()
+{
+    if( in_budget ) return;
+    
+    var budget = document.forms.form0.budget.value;
+    window.elect.runQuery(m, "/budget " + parseFloat(budget));
+}
+
+function updateSpeed()
+{
+    if( in_budget ) return;    
+
+    console.log("updateSpeed()");
+    let speed = parseFloat(document.forms.form0.speed.value);
+    if( document.forms.form0.autonomy.checked )
+        window.elect.runQuery(m, "/auto " + speed);
+}
+function setStatus(msg) {
+    gE("status").innerHTML = msg;
+}
+
+function generate() {
+    var usermsg = document.forms['form0'].data.value;
+    document.forms['form0'].data.value = "";
+    console.log("Send: " + usermsg);
+    myhist.push(usermsg);
+    current_history_element=myhist.length-1;
+    window.elect.runQuery(m, usermsg);
+}
+
+function resizeSkeleton(w, h) {
+    var t = gE("scrollarea");
+    var a = gE("inputarea");
+
+    t.style.maxHeight = t.style.height = (h-(6+a.clientHeight)) + "px";
+
+    var e = gE("textlog");
+    e.style.width = e.style.maxWidth = (w-5) + "px";
+}
+function initSkeleton() {
+
+    setupWindow();
+    console.log("initSkeleton()");
+    toggleDiv('inputarea');
+    radLoad();
+    var e = gE("textlog");
+    e.style.width = e.style.maxWidth = (winW-5) + "px";
+
+    //socketRegister( 'update', socketUpdate );
+    //socketRegister( 'choose', socketChoose );
+    //socketRegister( 'outcome', socketOutcome );
+    //openSocket(window.location.host, chatSocket);
+    //HtmlRequestGet('/aiactors.js', '', gotStart);
+    //radHook( "pagekey", pageUpdate );
+    //radHook( "sess", pageUpdate );
+    //if( radVar("pagekey") != null ) pageUpdate();
+
+}
+function toggleDiv(eid)
+{
+    var e = gE(eid);
+    if( !e ) return;
+    if( e.style.display == "none" ) {
+        e.style.display = "block";
+    } else {
+        e.style.display = "none";
+    }
+}
+
+function cE(x)
+{
+    return document.createElement(x);
+}
+let thismem = {};
+let formn = 32;
+    function finishEdit( parm, formn ) {
+        console.log("fined():",parm,formn);
+        let f = document.forms['form_' + formn];
+        f[parm].disabled = false;
+    }
+    function sendParameter( ev ) {
+        console.log("sendp():",ev.target);
+        let f = document.forms[ 'form_' + ev.target.getAttribute('fx') ];
+        let parm = ev.target.getAttribute('parm');
+        console.log("click(" + parm + ")", f[parm]);
+        f[parm].disabled = true;
+        editMemory(f.getAttribute('tp'), parm, f[parm].value, finishEdit.bind(parm,(formn-1)));            
+    }
+    function openfullText( ev ) {
+        let x = gE('x_' + ev.target.getAttribute('xp')); 
+        console.log("oft():",ev.target,x);
+        x.style.display = ( x.style.display=='none' ) ? 'block' : 'none';
+    }
+    function openfullTextb( ev ) {
+        let b = gE('b_' + ev.target.getAttribute('xp'));
+        console.log("oftb():",ev.target,b);
+        b.style.display = ( b.style.display=='none' ) ? 'block' : 'none';
+    }
+    function fillthis( ev ) {
+        console.log("fill():",ev.target);
+        let key = ev.target.getAttribute('fk');
+        thismem[key][1].eres.value = '';
+        thismem[key][1].edir.value = '';
+        thismem[key][1].tags.value = '';
+        window.elect.interface(m, "fill " + thismem[key][1].getAttribute('tp') );
+    }
+
+function buildMemoryEdit( parent, obj )
+{
+    console.log(obj);
+    var e = cE("div");
+    e.style.border = '1px solid white';
+    e.style.padding = '2px';
+    e.style.margin = '2px';
+    e.style.float = 'left';
+    e.style.clear = 'both';
+    var f = cE('form');
+    f.name = 'form_' + formn;
+    formn++;
+    thismem[ obj.key ] = [ obj, f, e ];
+    f.setAttribute('nomagic', true);
+    f.setAttribute('tp', obj.tp);
+    f.style.float = 'left';
+    e.style.float = 'left';
+    e.appendChild(f);
+
+    var g = cE("div");
+    g.className = "fl";
+    g.innerText = obj.attr + ": ";
+    f.appendChild(g);
+
+    var h = cE("div");
+    h.className = "fl";
+    if( 'sent' in obj ) {
+        var a = cE("div");
+        a.className = "fl";
+        a.innerText = "<|clue_start|>" + obj.clues + "<|clue_end|>: " + obj.sent;
+        h.appendChild(a);
+        var b = cE("div");
+        b.className = "cl";
+        h.appendChild(b);
+        var p = cE("div");
+        p.className = 'btn';
+        p.innerHTML = "+++";
+        h.appendChild(p);
+        var x = cE("div");
+        x.id = 'x_' + (formn-1);
+        x.className = "cl";
+        x.style.display = 'none';
+        x.innerText = obj.val;
+        p.setAttribute('xp', (formn-1));
+        p.setAttribute('onclick', 'openfullText(event)');
+        h.appendChild(x);
+    } else {
+        h.innerText = obj.val;
+    }
+
+    //me[from] = h;
+    f.appendChild(h);
+
+    h = cE("div");
+    h.className = "cl";
+    f.appendChild(h);
+
+    parent.appendChild(e);
+
+    var a = cE("div");
+    a.className = "btn";
+    a.innerHTML = "+++";
+
+    var b = cE("div");
+    b.id = 'b_' + (formn-1);
+    b.style.display='none';
+    a.setAttribute('xp', (formn-1));
+    a.setAttribute('onclick', 'openfullTextb(event)');
+
+    f.appendChild(a);
+
+    h = cE("div");
+    h.className = "cl";
+    f.appendChild(h);
+
+    f.appendChild(b);
+
+    var r, i, ih, l, z;
+
+    var parms = ['Emotional resonance', 'Emotional direction', 'Tags' ];
+    var parmn = [ 'eres', 'edir', 'tags' ];
+    for( var k=0; k<parms.length; k++ ) {
+
+        l = cE("div");
+        l.className = "fl";
+        l.innerHTML = parms[k] + ":";
+        ih = cE("div");
+        ih.className = "fl";
+        i = cE("input");
+        i.name = parmn[k];
+        i.type = 'text';
+        i.size = 60;
+        if( typeof obj[parmn[k]] != 'undefined' )
+            i.value = obj[parmn[k]];
+        ih.appendChild(i);
+
+        b.appendChild(l);
+        b.appendChild(ih);
+        z = cE("div");
+        z.className = "btn";
+        z.innerHTML = "send_" + parmn[k];
+        z.setAttribute('parm', parmn[k]);
+        z.setAttribute('fx', (formn-1));
+
+        z.setAttribute('onclick', 'sendParameter(event)');
+        b.appendChild(z);
+
+        r = cE("div");
+        r.className="cl";
+        b.appendChild(r);
+    }
+
+    h = cE("div");
+    h.className = "cl";
+    f.appendChild(h);
+
+    h = cE("div");
+    h.className = "btn";
+    h.innerHTML = "(Fill)";
+    h.setAttribute('fk', obj.key);
+    h.setAttribute('onclick', 'fillthis(event)');
+    f.appendChild(h);
+
+    h = cE("div");
+    h.className = "btn";
+    h.innerHTML = "Next>>";
+    h.setAttribute('onclick', 'nextMemory(event)');
+    f.appendChild(h);
+}
+function eTokens(str)
+{
+    var i;
+    var w="";
+    var r=[];
+    var alpha=false;
+    var a = 'a'.charCodeAt(0), z = 'z'.charCodeAt(0);
+
+    for( i=0; i<str.length; i++ ) {
+        var c = str[i].toLowerCase().charCodeAt(0);
+        if( c >= a && c <= z ) {
+            if( !alpha && w != "" ) {
+                r.push(w);
+                w="";
+            }
+            w += str[i];
+            alpha=true;
+            continue;
+        }
+        if( str[i] == "." || !isNaN(str[i]) ) {
+            if( alpha && w != "" ) {
+                r.push(w);
+                w="";
+            }
+            w = w + str[i];
+            alpha=false;
+            continue;
+        }
+        if( w != "" ) {
+            r.push(w);
+            w="";
+        }
+    }
+
+    return r;
+}
+function recvFill(key, parm, response)
+{
+    console.log("fill(" + parm + ") = " + response);
+    let res = eTokens(response);
+    let buf = "";
+    let pair = [false,false];
+    for( var i=0; i<res.length; i++ ) {
+        if( !isNaN(res[i]) ) {
+            pair[0] = res[i];
+            if( pair[1] !== false ) {
+                if( buf != "" ) buf += ",";
+                buf += pair[1] + ":" + pair[0];
+                pair = [false,false];
+            }
+        } else {
+            pair[1] = res[i];
+            if( pair[0] !== false ) {
+                if( buf != "" ) buf += ",";
+                buf += pair[1] + ":" + pair[0];
+                pair = [false,false];
+            }
+        }
+    }
+
+    thismem[key][1][parm].value = buf;
+}
+function nextMemory()
+{
+    var i = mytp.length-1;
+    while( i >= 0 ) {
+        if( mytp[i]+1 >= mylens[i] ) {
+            mytp[i] = 0;
+            mylens=null;
+            i--;
+            continue;
+        }
+        mytp[i]++;
+        break;
+    }
+
+    window.elect.interface(m, "review " + mytp.join(" "));
+}
+function editMemory(tp, param, value, cb)
+{
+    queueCmd("edit " + tp + " " + param + " " + value, cb);
+}
+function recvTimePointer(tp, lens)
+{
+    mytp = tp;
+    mylens = lens;
+    window.elect.interface(m, "review " + mytp.join(" "));
+}
+function recvMemData(obj)
+{
+    buildMemoryEdit(gE("textlog"), obj);
+}
+function recvProblem(content)
+{
+    alert(content);
+}
+function recvMessage(user, content, cbid, npast)
+{
+    if( typeof cbid != 'undefined' ) {
+
+    }
+    if( user == "Location" && content == 0 ) {
+        console.trace();
+    }
+    var i;
+    console.log("recv", user, ",", content);
+    if( typeof npast != 'undefined' ) {
+        var np = gE("npast");
+        var found=false;
+        console.log(np.children);
+        for( i=0; i<np.children.length; i++ ) {
+            if( np.children[i].getAttribute('artist') == user ) {
+                np.children[i].innerText = npast;
+                found = true;
+                break;
+            }
+        }
+        if( !found ) {
+            var x = cE("div");
+            x.innerText = npast;
+            x.setAttribute('artist', user);
+            np.appendChild(x);
+        }
+    }
+    if( user.indexOf("(past)") != -1 ) return;
+
+    var e = gE("textlog");
+    var x = 1;
+    var lc;
+
+    for( x=1; x<=e.childNodes.length; x++ ) {
+        if( x >= 3 ) break;
+        lc = e.childNodes[ e.childNodes.length-x ];
+        if( lc.getAttribute('fromuser') == user ) {
+            if( content === 0 ) {
+                lc.setAttribute('fromuser', "+" + user);
+            } else {
+                lc.innerHTML += content;
+            }
+            if( document.forms.form0.scroll.checked )
+                gE("scrollarea").scrollTop = e.clientHeight+10;
+            return;
+        }
+    }
+
+    if( content === 0 )
+        return;
+
+    lc = document.createElement("p");
+    lc.style.clear = 'both';
+    lc.setAttribute('fromuser', (content===0?"+":"") + user);
+    lc.innerHTML = user + ": " + content;
+
+    e.appendChild( lc );
+    if( document.forms.form0.scroll.checked )
+        gE("scrollarea").scrollTop = e.clientHeight+10;
+}
+
+let ambusy=false;
+function busySignal(status)
+{
+    ambusy = status;
+    gE("busynode").className = status ? 'rotating' : 'notbusy';
+}
+let cmdlist=[];
+let cbids=[];
+function queueCmd(cmd, cb)
+{
+    var id;
+    do {
+        id = parseInt( Math.random()*1000000 );
+    } while( cbids.indexOf(id) >= 0 );
+    cbids.push(id);
+    cmdlist.push({id:cbid,cmd:cmd,cb:cb});
+    let args = cmd.split(" ");
+    window.elect.interface(m, args.shift() + " " + cbid + " " + args.join(" "));
+}
+function recvFailure(cbid)
+{
+    alert("failed on " + cbid);
+    var i;
+    for( i=0; i<cmdlist.length; i++ ){ 
+        if( cmdlist[i].id == cbid ) {
+            cmdlist.splice(i,1);
+            return;
+        }
+    }
+    alert("unlisted failed command " + cbid);
+}
+function recvGood(cbid)
+{
+    var i;
+    for( i=0; i<cmdlist.length; i++ ){ 
+        if( cmdlist[i].id == cbid ) {
+            if( typeof cmdlist[i].cb == 'function' )
+                cmdlist[i].cb( cbid );
+            cmdlist.splice(i,1);
+            return;
+        }
+    }
+    alert("unlisted command " + cbid);
+}
+function nowCmd(cmd)
+{
+    window.elect.interface(m, cmd);
+}
+function setupWindow()
+{
+    console.log("setupWindow()");
+    window.elect.receive('activate', (value) => {
+        console.log("Activated with " + value);
+        m = value;
+        startup();
+    });
+
+    window.elect.receive('busy', busySignal);
+
+    window.elect.receive('message', recvMessage);
+    window.elect.receive('memdata', recvMemData);
+    window.elect.receive('timepointer', recvTimePointer);
+    window.elect.receive('problem', recvProblem);
+    window.elect.receive('fail', recvFailure);
+    window.elect.receive('good', recvGood);
+    window.elect.receive('fill', recvFill);
+
+    window.elect.receive('setBudget', (value, autonomy) => {
+        console.log("setBudget(", value, autonomy, ")");
+        mybudget = value;
+        myautonomy = autonomy;
+
+        in_budget=true;
+        document.forms.form0.budget.value = mybudget;
+        document.forms.form0.autonomy.checked = ( myautonomy != 0 );
+        document.forms.form0.speed.value = myautonomy==0?5:myautonomy;
+        in_budget=false;
+
+        var typer = document.getElementById('typingbox');
+        typer.disabled = false;
+    });
+}
+
+//<!-- Radiant
+var startfuncs = new Array(), resizefuncs = new Array(), kbupfuncs = [], kbfuncs2 = [], kbfuncs = new Array(), loadedfuncs = new Array();
+var startxfuncs = new Array(), resizexfuncs = new Array();
+var clickfuncs = new Array(), has_started=false;
+
+function aIndex(arr,key)
+{
+    if( typeof arr == 'object' && typeof arr.indexOf == 'function' ) return arr.indexOf(key);
+    for( var i in arr ) {
+        if( arr[i] == key ) return i;
+    }
+    return -1;
+}
+function registerClick(fnc)
+{
+    if( aIndex(clickfuncs, fnc) != -1 ) return;
+    clickfuncs.push(fnc);
+}
+
+function unregClick(fnc)
+{
+    var i = aIndex(clickfuncs, fnc);
+    if( i == -1 ) return;
+    clickfuncs.splice(i,1);
+}
+function registerStartup(fnc)
+{
+    var i;
+    if( has_started ) fnc();
+    if( aIndex(startfuncs,fnc) != -1 ) return;
+    startfuncs.push(fnc);
+}
+function XRegisterStartup(xc)
+{
+    if( has_started ) eval(xc);
+    if( aIndex(startxfuncs, xc) != -1 ) return;
+    startxfuncs.push(xc);
+}
+function registerLoaded(fnc)
+{
+    if( aIndex(loadedfuncs, fnc) != -1 ) return;
+    if( has_started ) fnc();
+    loadedfuncs.push(fnc);
+}
+function XRegisterResize(xc)
+{
+    if( aIndex(resizexfuncs, xc) != -1 ) return;
+    resizexfuncs.push(xc);
+}
+function registerResize(fnc)
+{
+    if( aIndex(resizefuncs, fnc) != -1 ) return;
+    resizefuncs.push(fnc);
+}
+function unregResize(fnc)
+{
+    var i = aIndex(resizefuncs, fnc);
+    if( i == -1 ) return;
+    resizefuncs.splice(i,1);
+}
+function registerKeyUp(fnc)
+{
+    if( aIndex(kbupfuncs, fnc) != -1 ) return;
+    kbupfuncs.push(fnc);
+}
+function unregKeyUp(fnc)
+{
+    var i = aIndex(kbupfuncs, fnc);
+    if( i == -1 ) return;
+    kbupfuncs.splice(i,1);
+}
+function registerKeyboard(fnc)
+{
+    if( aIndex(kbfuncs, fnc) != -1 ) return;
+    kbfuncs.push(fnc);
+}
+function unregKeyboard(fnc)
+{
+    var i = aIndex(kbfuncs, fnc);
+    if( i == -1 ) return;
+    kbfuncs.splice(i,1);
+}
+function registerKeyboard2(fnc)
+{
+    if( aIndex(kbfuncs2, fnc) != -1 ) return;
+    kbfuncs2.push(fnc);
+}
+function unregKeyboard2(fnc)
+{
+    var i = aIndex(kbfuncs2, fnc);
+    if( i == -1 ) return;
+    kbfuncs2.splice(i,1);
+}
+function endEvent(ev)
+{
+    if( typeof ev.stopPropagation != 'undefined' ) ev.stopPropagation();
+    ev.cancelBubble = true;
+}
+document.onclick = function mouseClick()
+{
+    var i,n=false;
+    for( i = 0; i < clickfuncs.length; i++ ) {
+        if( (n=clickfuncs[i]()) > 0 ) {
+            endEvent(window.event);
+            return true;
+        } else if( n < 0 ) {
+            return true;
+        } else if( n === 0 ) {
+            return false;
+        }
+    }
+}
+function winSize()
+{
+    if( typeof document.winW != 'undefined' ) {
+        winW = document.winW;
+        winH = document.winH;
+    } else if( typeof window.innerWidth != 'undefined' && window.innerWidth != 0 ) {
+        winW = window.innerWidth;
+        winH = window.innerHeight;
+    } else if( typeof document.body.clientWidth != 'undefined' && document.body.clientWidth != 0 ) {
+        winW = document.body.clientWidth;
+        winH = document.body.clientHeight;
+    } else {
+        winW = document.documentElement.clientWidth;
+        winH = document.documentElement.clientHeight;
+//if( typeof window.screen != 'undefined' ) {
+//      winW = window.screen.availWidth;
+//      winH = window.screen.availHeight;
+//  } else
+    }
+    if( radStore ) {
+        radStore("window.width", winW);
+        radStore("window.height", winH);
+    }
+}
+function windowResize()
+{
+    winSize();
+    var i; // run callbacks
+    for( i = 0; i < resizefuncs.length; i++ ) {
+      resizefuncs[i](winW, winH);
+    }
+    for( i=0;i<resizexfuncs.length;i++ ) {
+      eval( resizexfuncs[i] );
+    }
+    console.log("resize--");
+}
+
+function windowStartup()
+{
+    console.log("onload()");
+    has_started = true;
+    winSize();
+    var i; // run callbacks
+    for( i = 0; i < startfuncs.length; i++ ) {
+        //try {
+          startfuncs[i]();
+        //} catch( e ) {
+//          console.warn("Warning: Couldn't run sf " + i + ": " + e, startfuncs[i]);
+  //      }
+    }
+    for( i=0;i<startxfuncs.length;i++ ) {
+    //    try {
+          eval( startxfuncs[i] );
+      //} catch( e ) {
+//        console.warn("Warning: Couldn't run sxf " + i + ": " + e, startxfuncs[i]);
+  //    }
+    }
+
+    for( i = 0; i < loadedfuncs.length; i++ ) {
+      //try {
+        loadedfuncs[i]();
+      //} catch( e ) {
+//        console.warn("Warning: Couldn't run lf " + i + ": " + e, loadedfuncs[i]);
+  //    }
+    }
+    window.onresize = windowResize;
+    console.log("onload--");
+    winStarted = true;
+    windowResize();
+}
+//window.onload = windowStartup;
+//document.addEventListener( "DOMContentLoaded", domStartup, false );
+registerStartup(initSkeleton);
+registerResize(resizeSkeleton);
+window.addEventListener( "load", windowStartup, false );
+
+</script>
+</body>
+</html>

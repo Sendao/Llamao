@@ -38,7 +38,7 @@ stores a keyed memory for all actors.
 
 ## &actor_name\n
 begins a sequence to load external memories from a text file. See main.js:/convert for details.
-essentially it goes &actor_name\nfrom_name\nyear_month_day_hour_minute_second:<message>"<store_end>"\nfrom_name2....
+essentially it goes &actor_name\nfrom_name\nyear_month_day_hour_minute_second:message"<store_end>"\nfrom_name2....
 
 
 # Contact
