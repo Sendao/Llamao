@@ -1984,6 +1984,15 @@ typedef struct llama_kv_cache {
 
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
+    void prepare(void)
+    {
+        LLAMA_LOG_INFO("Prepare kv_cache\n");
+        new (&(k_l)) std::vector<struct ggml_tensor*>;
+        new (&(v_l)) std::vector<struct ggml_tensor *>;
+        new (&ctxs) std::vector<struct ggml_context *>;
+        new (&bufs) std::vector<ggml_backend_buffer_t>;
+        LLAMA_LOG_INFO("Prepared kv_cache\n");
+    }
 
     void *buffer( size_t len )
     {
@@ -2105,14 +2114,14 @@ typedef struct llama_kv_cache {
 } Kv_cache;
 
 struct llm_org_context {
-    Kv_cache & kv_self;
+    Kv_cache *kv_self;
     std::vector<uint8_t> & buf_compute_meta;
     ggml_backend_sched *sched;
 
     struct ggml_context * ctx0 = nullptr;
     uint16_t n_embd_k_gqa, n_embd_v_gqa;
 
-    llm_org_context( Kv_cache &kv,
+    llm_org_context( Kv_cache *kv,
                      std::vector<uint8_t> &compute_meta,
                      ggml_backend_sched *scheduler,
                      llama_hparams hparams
@@ -2178,9 +2187,9 @@ struct llm_org_context {
             int tgt_v = buffer_target * 2;
             int tgt_k = tgt_v * 1024;
             for( int il = 0; il < 32; ++il ) { // it's the same amt of memory, 1024*overlap_v
-                ggml_backend_tensor_set(kv_self.k_l[il], k_buffer_layers[il], tgt_k, size_k );
+                ggml_backend_tensor_set(kv_self->k_l[il], k_buffer_layers[il], tgt_k, size_k );
                 for( int i=0; i<1024; i++ ) {
-                    ggml_backend_tensor_set(kv_self.v_l[il], (void*)((char*)v_buffer_layers[il]+(size_v*i)), tgt_v+(8192*i), size_v );
+                    ggml_backend_tensor_set(kv_self->v_l[il], (void*)((char*)v_buffer_layers[il]+(size_v*i)), tgt_v+(8192*i), size_v );
                 }
                 myPool.release(k_buffer_layers[il]);
                 myPool.release(v_buffer_layers[il]);
@@ -2204,7 +2213,7 @@ struct llm_org_context {
             return -1;
         }
 
-        int empty_sz = kv_self.size - empty_start;
+        int empty_sz = kv_self->size - empty_start;
         int from_sz = from_en - from_st;
         int overlap = from_sz - ( used_start - to_st );
         if( overlap < 0 ) overlap = 0;
@@ -2239,55 +2248,55 @@ struct llm_org_context {
             if( overlap > 0 ) {
                 k_buffer_layers[il] = myPool.alloc( overlap_k );
                 v_buffer_layers[il] = myPool.alloc( overlap_k ); // it's the same amt of memory, 1024*overlap_v
-                ggml_backend_tensor_get(kv_self.k_l[il], k_buffer_layers[il], to_st_k, overlap_k );
+                ggml_backend_tensor_get(kv_self->k_l[il], k_buffer_layers[il], to_st_k, overlap_k );
                 for( int i=0; i<1024; i++ ) {
-                    ggml_backend_tensor_get(kv_self.v_l[il], (void*)((char*)v_buffer_layers[il]+(overlap_v*i)), to_st_v+(8192*i), overlap_v );
+                    ggml_backend_tensor_get(kv_self->v_l[il], (void*)((char*)v_buffer_layers[il]+(overlap_v*i)), to_st_v+(8192*i), overlap_v );
                 }
             }
 
-            view_k_src = ggml_view_2d(ctx0, kv_self.k_l[il],
+            view_k_src = ggml_view_2d(ctx0, kv_self->k_l[il],
                     n_embd_k_gqa, from_sz,
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*from_st));
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*from_st));
 
-            view_k_dst = ggml_view_2d(ctx0, kv_self.k_l[il],
+            view_k_dst = ggml_view_2d(ctx0, kv_self->k_l[il],
                     n_embd_k_gqa, from_sz,
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*to_st));
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*to_st));
 
-            view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
+            view_v_src = ggml_view_2d(ctx0, kv_self->v_l[il],
                     from_sz, n_embd_v_gqa,
-                    ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
-                    ggml_row_size(kv_self.v_l[il]->type, from_st));
+                    ggml_row_size(kv_self->v_l[il]->type, kv_self->size),
+                    ggml_row_size(kv_self->v_l[il]->type, from_st));
 
-            view_v_dst = ggml_view_2d(ctx0, kv_self.v_l[il],
+            view_v_dst = ggml_view_2d(ctx0, kv_self->v_l[il],
                     from_sz, n_embd_v_gqa,
-                    ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
-                    ggml_row_size(kv_self.v_l[il]->type, to_st));
+                    ggml_row_size(kv_self->v_l[il]->type, kv_self->size),
+                    ggml_row_size(kv_self->v_l[il]->type, to_st));
 
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_k_src, view_k_dst));
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
 
             if( remnant > 0 ) {
-                view_k_src = ggml_view_2d(ctx0, kv_self.k_l[il],
+                view_k_src = ggml_view_2d(ctx0, kv_self->k_l[il],
                         n_embd_k_gqa, remnant,
-                        ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                        ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*overlap_end));
+                        ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
+                        ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*overlap_end));
 
-                view_k_dst = ggml_view_2d(ctx0, kv_self.k_l[il],
+                view_k_dst = ggml_view_2d(ctx0, kv_self->k_l[il],
                         n_embd_k_gqa, remnant,
-                        ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                        ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*overlap_tgt));
+                        ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
+                        ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*overlap_tgt));
 
-                view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
+                view_v_src = ggml_view_2d(ctx0, kv_self->v_l[il],
                         remnant, n_embd_v_gqa,
-                        ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
-                        ggml_row_size(kv_self.v_l[il]->type, overlap_end));
+                        ggml_row_size(kv_self->v_l[il]->type, kv_self->size),
+                        ggml_row_size(kv_self->v_l[il]->type, overlap_end));
 
-                view_v_dst = ggml_view_2d(ctx0, kv_self.v_l[il],
+                view_v_dst = ggml_view_2d(ctx0, kv_self->v_l[il],
                         remnant, n_embd_v_gqa,
-                        ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
-                        ggml_row_size(kv_self.v_l[il]->type, overlap_tgt));
+                        ggml_row_size(kv_self->v_l[il]->type, kv_self->size),
+                        ggml_row_size(kv_self->v_l[il]->type, overlap_tgt));
 
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_k_src, view_k_dst));
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
@@ -2307,8 +2316,8 @@ struct llm_org_context {
 
     int shuffle_kv(int start, int end, int delta) {
         struct ggml_cgraph * gf = get_shuffler();
-        if( delta > 0 && end+delta > kv_self.size ) {
-            end = kv_self.size - delta;
+        if( delta > 0 && end+delta > kv_self->size ) {
+            end = kv_self->size - delta;
         }
         int tgt = start + delta;
         if( tgt < 0 ) {
@@ -2321,25 +2330,25 @@ struct llm_org_context {
         LLAMA_LOG_INFO("%s: %d-%d ++ %d -> %d\n", __func__, start, end, delta, tgt);
 
         for (int il = 0; il < 32; ++il) {
-            ggml_tensor * view_k_src = ggml_view_2d(ctx0, kv_self.k_l[il],
+            ggml_tensor * view_k_src = ggml_view_2d(ctx0, kv_self->k_l[il],
                     n_embd_k_gqa, range,
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*start));
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*start));
 
-            ggml_tensor * view_k_dst = ggml_view_2d(ctx0, kv_self.k_l[il],
+            ggml_tensor * view_k_dst = ggml_view_2d(ctx0, kv_self->k_l[il],
                     n_embd_k_gqa, range,
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                    ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*tgt));
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
+                    ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*tgt));
 
-            ggml_tensor * view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
+            ggml_tensor * view_v_src = ggml_view_2d(ctx0, kv_self->v_l[il],
                     range, n_embd_v_gqa,
-                    ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
-                    ggml_row_size(kv_self.v_l[il]->type, start));
+                    ggml_row_size(kv_self->v_l[il]->type, kv_self->size),
+                    ggml_row_size(kv_self->v_l[il]->type, start));
 
-            ggml_tensor * view_v_dst = ggml_view_2d(ctx0, kv_self.v_l[il],
+            ggml_tensor * view_v_dst = ggml_view_2d(ctx0, kv_self->v_l[il],
                     range, n_embd_v_gqa,
-                    ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
-                    ggml_row_size(kv_self.v_l[il]->type, tgt));
+                    ggml_row_size(kv_self->v_l[il]->type, kv_self->size),
+                    ggml_row_size(kv_self->v_l[il]->type, tgt));
 
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_k_src, view_k_dst));
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
@@ -2356,13 +2365,13 @@ struct llm_org_context {
             if( i+8 < end ) {
                 v = 0;
             } else {
-                v = kv_self.inuse[t];
+                v = kv_self->inuse[t];
                 for( int b=0; b+i<end; b++ ) {
                     if( b+i >= tgt && b+i <= tgt+range ) break;
                     v &= ~( 1 << (7-b) );
                 }
             }
-            kv_self.inuse[t] = v;
+            kv_self->inuse[t] = v;
         }
         end = tgt + range;
 
@@ -2370,12 +2379,12 @@ struct llm_org_context {
             if( i+8 < end ) {
                 v = 0xff;
             } else {
-                v = kv_self.inuse[t];
+                v = kv_self->inuse[t];
                 for( int b=0; b+i<end; b++ ) {
                     v |= ( 1 << (7-b) );
                 }
             }
-            kv_self.inuse[t] = v;
+            kv_self->inuse[t] = v;
         }
         */
 
@@ -2912,6 +2921,15 @@ struct system_actor {
 
     std::unordered_map<std::string, Kv_mem*> keys;
 
+    void prepare(void)
+    {
+        new (&mem)     std::vector<Kv_mem *>; // identity variables & persona variables
+        new (&rags) std::vector<Kv_mem *>;
+        new (&history) std::vector<Kv_mem *>; // things you have seen happen long ago (used for pulling RAG)
+        new (&recent) std::vector<Kv_mem *>;
+        new (&keys) std::unordered_map<std::string, Kv_mem*>;
+    }
+
     void release()
     {
         std::vector<Kv_mem*>::iterator i;
@@ -3241,13 +3259,13 @@ struct llama_model {
 #define CONTEXT_USER 2
 #define CONTEXT_WORKER 3
 
+
 struct llama_context {
     bool is_clone=false;
     llama_context(llama_model & model) : model(model), t_start_us(model.t_start_us), t_load_us(model.t_load_us) {
-        //memset( kv_self.inuse, 0, 512 );
-        current_context = this;
+        //memset( kv_self->inuse, 0, 512 );
     }
-    struct llama_kv_cache kv_self;
+    struct llama_kv_cache *kv_self;
     ~llama_context() {
         LLAMA_LOG_INFO("%s: eliminate %p\n", __func__, this);
 
@@ -3337,28 +3355,42 @@ struct llama_context {
 #endif
 };
 
+void prepare_kv_cache(struct llama_context *ctx, int n_ctx, int n_batch);
 
 typedef struct system_kb System_kb;
 struct system_kb {
     std::vector<System_actor*> actors;
     std::unordered_map<std::string, System_actor*> players;
     std::unordered_map<std::string, std::vector<Kv_mem*>> ragwordmap;
-
-    //! add a map for 'where'->'time'->'<memory>'
-
-    // prepare these:
-    std::vector<uint8_t>    &compute_meta;
-    ggml_backend_sched      *scheduler;
-    llama_hparams           hparams;
-
-    std::string active_actor;
-
     struct llama_kv_cache kv[3];
+
     uint16_t kv_extent[3] = {0,0,0};
     uint16_t seq_start[3] = {0,0,0};
     std::vector<Kv_mem*> *kvmap[3] = {NULL,NULL,NULL};
     System_actor *kvuser[3] = {NULL,NULL,NULL};
     bool kv_ready[3] = {false,false,false};
+
+    void prepare(void)
+    {
+        new (&actors)     std::vector<System_actor*>;
+        new (&players) std::unordered_map<std::string, System_actor*>;
+        new (&ragwordmap) std::unordered_map<std::string, std::vector<Kv_mem*>> ;
+        new (&active_actor) std::string;
+        for( int i=0; i<3; i++ ) {
+            new (&(kv[i])) struct llama_kv_cache;
+            //kv[i].prepare();
+            kv_extent[i] = 0;
+            seq_start[i] = 0;
+            kvmap[i] = NULL;
+            kvuser[i] = NULL;
+            kv_ready[i] = false;
+        }
+        LLAMA_LOG_INFO("%s: prepared system_kb\n", __func__);
+    }
+    llama_hparams           hparams;
+
+    std::string active_actor;
+    int n_batch = 64;
 
     // save all actors' current data
     void saveall(void)
@@ -3393,16 +3425,25 @@ struct system_kb {
     }
     void init(int n, int n_ctx)
     {
-        if( kv_ready[n] ) return;
+        if( kv_ready[n] ) {
+            LLAMA_LOG_INFO("%s: already prepared %d\n", __func__, n);
+            return;
+        }
 
         kv_extent[n] = n_ctx;
+        LLAMA_LOG_INFO("%s: preparing kv %d\n", __func__, n);
+        kv[n].prepare();
+        LLAMA_LOG_INFO("%s: prepared kv %d\n", __func__, n);
 
-        if (!llama_kv_cache_init(kv[n], *current_model,
+        if (!llama_kv_cache_init((kv[n]), *current_model,
                 GGML_TYPE_F16, GGML_TYPE_F16, kv_context*n_ctx,
                 true)) {
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
             throw "Could not allocate kv cache.";
         }
+
+        current_context->kv_self = &(kv[n]);
+        prepare_kv_cache(current_context, n_ctx, n_batch);
 
         seq_start[n] = 0;
 
@@ -3461,7 +3502,7 @@ struct system_kb {
         init(kvno, kvno==0?1024:4096);
 
         current_context->seq_end = seq_start[kvno];
-        memcpy( &current_context->kv_self, &kv[kvno], sizeof(llama_kv_cache));
+        current_context->kv_self = &(kv[kvno]);
 
         return &kv[kvno];
     }
@@ -3582,7 +3623,7 @@ struct system_kb {
             }
         }
 
-        Org_context llm(kv[kvno], compute_meta, scheduler, hparams);
+        Org_context llm(&kv[kvno], current_context->buf_compute_meta, current_context->sched, hparams);
         bool initialized=false;
         // finish by moving memories that can be shuffled around
         n_tokens=0;
@@ -3814,7 +3855,10 @@ struct system_kb {
 
         if( players.count(who) <= 0 ) {
             // initialize actor
+            LLAMA_LOG_INFO("%s: prepare actor %s\n", __func__, who.c_str());
             a = (System_actor*)myPool.alloc(sizeof(*a));
+            new (a) System_actor;
+            a->prepare();
             a->name = who;
             if( who != "System" )
                 a->loadfile();
@@ -6744,7 +6788,7 @@ static struct ggml_tensor * llm_build_inp_embd(
 static void llm_build_kv_store(
         struct ggml_context * ctx,
         const llama_hparams & hparams,
-       llama_kv_cache & kv,
+       llama_kv_cache * kv,
          struct ggml_cgraph * graph,
          struct ggml_tensor * k_cur,
          struct ggml_tensor * v_cur,
@@ -6761,13 +6805,13 @@ static void llm_build_kv_store(
     //struct ggml_tensor * v_cur_t = ggml_transpose(ctx, v_cur); // TODO: reshape above is likely not needed
     cb(v_cur_t, "v_cur_t", il);
 
-    struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa, // how much attention is on each token
-            (ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa))*kv_head);
+    struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv->k_l[il], n_tokens*n_embd_k_gqa, // how much attention is on each token
+            (ggml_row_size(kv->k_l[il]->type, n_embd_k_gqa))*kv_head);
     cb(k_cache_view, "k_cache_view", il);
 
-    struct ggml_tensor * v_cache_view = ggml_view_2d(ctx, kv.v_l[il], n_tokens, n_embd_v_gqa, // how much each other token is related to it?
-            (  n_ctx)*ggml_type_size(kv.v_l[il]->type),
-            (kv_head)*ggml_type_size(kv.v_l[il]->type));
+    struct ggml_tensor * v_cache_view = ggml_view_2d(ctx, kv->v_l[il], n_tokens, n_embd_v_gqa, // how much each other token is related to it?
+            (  n_ctx)*ggml_type_size(kv->v_l[il]->type),
+            (kv_head)*ggml_type_size(kv->v_l[il]->type));
     cb(v_cache_view, "v_cache_view", il);
 
     //LLAMA_LOG_INFO("Building kv: building data\n");
@@ -6906,7 +6950,7 @@ static struct ggml_tensor * llm_build_kqv(
         struct ggml_context * ctx,
           const llama_model & model,
         const llama_hparams & hparams,
-       const llama_kv_cache & kv,
+       const llama_kv_cache * kv,
          struct ggml_cgraph * graph,
          struct ggml_tensor * wo,
          struct ggml_tensor * wo_b,
@@ -6932,12 +6976,12 @@ static struct ggml_tensor * llm_build_kqv(
     cb(q, "q", il);
 
     struct ggml_tensor * k =
-        ggml_view_3d(ctx, kv.k_l[il],
+        ggml_view_3d(ctx, kv->k_l[il],
                 n_embd_head_k, // 128
                 n_kv, // head
                 n_head_kv, // 8
-                ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa), // 1024
-                ggml_row_size(kv.k_l[il]->type, n_embd_head_k), // 128
+                ggml_row_size(kv->k_l[il]->type, n_embd_k_gqa), // 1024
+                ggml_row_size(kv->k_l[il]->type, n_embd_head_k), // 128
                 0);
     cb(k, "k", il);
 
@@ -6955,12 +6999,12 @@ static struct ggml_tensor * llm_build_kqv(
 
     // split cached v into n_head heads
     struct ggml_tensor * v =
-        ggml_view_3d(ctx, kv.v_l[il],
+        ggml_view_3d(ctx, kv->v_l[il],
                 n_kv, // head
                 n_embd_head_v, // 128
                 n_head_kv, // 8
-                ggml_element_size(kv.v_l[il])*n_ctx,
-                ggml_element_size(kv.v_l[il])*n_ctx*n_embd_head_v,
+                ggml_element_size(kv->v_l[il])*n_ctx,
+                ggml_element_size(kv->v_l[il])*n_ctx*n_embd_head_v,
                 0);
     cb(v, "v", il);
 
@@ -6996,7 +7040,7 @@ static struct ggml_tensor * llm_build_kv(
         struct ggml_context * ctx,
           const llama_model & model,
         const llama_hparams & hparams,
-        llama_kv_cache & kv,
+        llama_kv_cache * kv,
          struct ggml_cgraph * graph,
          struct ggml_tensor * wo,
          struct ggml_tensor * wo_b,
@@ -7066,7 +7110,7 @@ struct llm_build_context {
     const llama_hparams  & hparams;
     const llama_cparams  & cparams;
     const llama_batch    & batch;
-          llama_kv_cache & kv_self;
+          llama_kv_cache * kv_self;
 
     const int64_t n_embd;
     const int64_t n_layer;
@@ -7138,8 +7182,8 @@ struct llm_build_context {
         norm_eps         (hparams.f_norm_eps),
         norm_rms_eps     (hparams.f_norm_rms_eps),
         n_tokens         (batch.n_tokens),
-        n_kv             (worst_case ? lctx.kv_self.size : (lctx.seq_end+n_tokens) ),
-        kv_head          (worst_case ? (lctx.kv_self.size -n_tokens) : lctx.seq_end),
+        n_kv             (worst_case ? lctx.kv_self->size : (lctx.seq_end+n_tokens) ),
+        kv_head          (worst_case ? (lctx.kv_self->size -n_tokens) : lctx.seq_end),
         n_orig_ctx       (cparams.n_yarn_orig_ctx),
         pooling_type     (cparams.pooling_type),
         rope_type        (hparams.rope_type),
@@ -7172,10 +7216,10 @@ struct llm_build_context {
             struct ggml_tensor * tmp =
                 // we rotate only the first n_rot dimensions
                 ggml_rope_custom_inplace(ctx0,
-                        ggml_view_3d(ctx0, kv_self.k_l[il],
+                        ggml_view_3d(ctx0, kv_self->k_l[il],
                             n_embd_head_k, n_head_kv, n_keys,
-                            ggml_row_size(kv_self.k_l[il]->type, n_embd_head_k),
-                            ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
+                            ggml_row_size(kv_self->k_l[il]->type, n_embd_head_k),
+                            ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
                             0),
                         lctx.inp_K_shift, n_rot, rope_type, 0, n_orig_ctx, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow);
@@ -7203,25 +7247,25 @@ struct llm_build_context {
             }
 
             for (int il = 0; il < n_layer; ++il) {
-                ggml_tensor * view_k_src = ggml_view_2d(ctx0, kv_self.k_l[il],
+                ggml_tensor * view_k_src = ggml_view_2d(ctx0, kv_self->k_l[il],
                         n_embd_k_gqa, nm,
-                        ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                        ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*i));
+                        ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
+                        ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*i));
 
-                ggml_tensor * view_k_dst = ggml_view_2d(ctx0, kv_self.k_l[il],
+                ggml_tensor * view_k_dst = ggml_view_2d(ctx0, kv_self->k_l[il],
                         n_embd_k_gqa, nm,
-                        ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa),
-                        ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*id));
+                        ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa),
+                        ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*id));
 
-                ggml_tensor * view_v_src = ggml_view_2d(ctx0, kv_self.v_l[il],
+                ggml_tensor * view_v_src = ggml_view_2d(ctx0, kv_self->v_l[il],
                         nm, n_embd_v_gqa,
-                        ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
-                        ggml_row_size(kv_self.v_l[il]->type, i));
+                        ggml_row_size(kv_self->v_l[il]->type, kv_self->size),
+                        ggml_row_size(kv_self->v_l[il]->type, i));
 
-                ggml_tensor * view_v_dst = ggml_view_2d(ctx0, kv_self.v_l[il],
+                ggml_tensor * view_v_dst = ggml_view_2d(ctx0, kv_self->v_l[il],
                         nm, n_embd_v_gqa,
-                        ggml_row_size(kv_self.v_l[il]->type, kv_self.size),
-                        ggml_row_size(kv_self.v_l[il]->type, id));
+                        ggml_row_size(kv_self->v_l[il]->type, kv_self->size),
+                        ggml_row_size(kv_self->v_l[il]->type, id));
 
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_k_src, view_k_dst));
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, view_v_src, view_v_dst));
@@ -7247,7 +7291,7 @@ struct llm_build_context {
         struct ggml_tensor * cur;
         struct ggml_tensor * inpL;
 
-        //LLAMA_LOG_INFO("build_inp_embd\n");
+        LLAMA_LOG_INFO("build_inp_embd\n");
         inpL = llm_build_inp_embd(ctx0, hparams, batch, model.tok_embd, lctx.inp_tokens, lctx.inp_embd, cb);
         cb(inpL, "inp_embd", -1);
 
@@ -7268,7 +7312,7 @@ struct llm_build_context {
             out_embd = ggml_view_1d(ctx0, model.output_embd, 32*4096, 0);
             LLAMA_LOG_INFO("%s: out_embd type = %s, size = %d\n", __func__, ggml_type_name(out_embd->type), ggml_type_size(out_embd->type));
         } else {
-            //LLAMA_LOG_INFO("build_layers\n");
+            LLAMA_LOG_INFO("build_layers\n");
         }
 
         for (int il = 0; il < n_layer; ++il) {
@@ -10034,7 +10078,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         pattern[i] = -INFINITY;
     }
     /* old method using inuse flags
-        uint8_t x = kv_self.inuse[ t ];
+        uint8_t x = kv_self->inuse[ t ];
         if( x == 0xff ) {
             for( int b=0; b<8 && (b+i) < n_kv; b++ ) {
                 if( i+b >= lctx.seq_end ) pattern[i+b] = -INFINITY;
@@ -10126,9 +10170,9 @@ static int llama_decode_internal(
     }
 
 /*    if( n_tokens > 1 ) {
-        LLAMA_LOG_INFO("%s: decode_internal n_ctx=%d, n_tokens = %d, seq_start=%d, seq_end=%d, ctx_ready = %s\n", __func__, lctx.kv_self.size, n_tokens, lctx.sequential_start, lctx.seq_end, lctx.ctx_ready?"true":"false");
+        LLAMA_LOG_INFO("%s: decode_internal n_ctx=%d, n_tokens = %d, seq_start=%d, seq_end=%d, ctx_ready = %s\n", __func__, lctx.kv_self->size, n_tokens, lctx.sequential_start, lctx.seq_end, lctx.ctx_ready?"true":"false");
     } else {
-        LLAMA_LOG_INFO("%s: decode_internal n_ctx=%d, token=%d (%s), seq_start=%d, seq_end=%d, ctx_ready = %s\n", __func__, lctx.kv_self.size, batch.token[0], llama_token_get_text(&lctx.model, batch.token[0]), lctx.sequential_start, lctx.seq_end, lctx.ctx_ready?"true":"false");
+        LLAMA_LOG_INFO("%s: decode_internal n_ctx=%d, token=%d (%s), seq_start=%d, seq_end=%d, ctx_ready = %s\n", __func__, lctx.kv_self->size, batch.token[0], llama_token_get_text(&lctx.model, batch.token[0]), lctx.sequential_start, lctx.seq_end, lctx.ctx_ready?"true":"false");
     }*/
 
     //LLAMA_LOG_INFO("%s: context %p\n", __func__, &lctx);
@@ -10156,12 +10200,12 @@ static int llama_decode_internal(
     const int64_t n_embd  = hparams.n_embd;
     const int64_t n_vocab = hparams.n_vocab;
 
-    //LLAMA_LOG_INFO("%s: kv_self %p (%p)\n", __func__, &lctx, lctx.sched);
+    LLAMA_LOG_INFO("%s: kv_self %p (%p)\n", __func__, &lctx, lctx.sched);
     ggml_backend_sched_reset(lctx.sched);
     ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
     //LLAMA_LOG_INFO("%s: kv_self\n", __func__);
 
-    //lctx.kv_self.use_tokens(lctx.seq_end, batch.n_tokens);
+    //lctx.kv_self->use_tokens(lctx.seq_end, batch.n_tokens);
 
     //LLAMA_LOG_INFO("%s: build graph\n", __func__);
     ggml_cgraph * gf = llama_build_graph(lctx, batch, false);
@@ -10338,6 +10382,37 @@ static int llama_decode_internal(
     return 0;
 }
 
+std::vector<ggml_backend_buffer_type_t> backend_buft;
+
+void prepare_kv_cache(struct llama_context *ctx, int n_ctx, int n_batch)
+{
+    // build worst-case graph
+    int n_tokens = (int)std::min(n_ctx, n_batch);
+    int n_past = n_ctx - n_tokens;
+    llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
+    ggml_cgraph * gf = llama_build_graph(*ctx, llama_batch_get_one(&token, n_tokens, n_past, 0), true);
+
+    // initialize scheduler with the worst-case graph
+    if (!ggml_backend_sched_reserve(ctx->sched, gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+        return;
+    }
+
+    for (size_t i = 0; i < ctx->backends.size(); i++) {
+        ggml_backend *backend = ctx->backends[i];
+        ggml_backend_buffer_type_t buft = backend_buft[i];
+        size_t size = ggml_backend_sched_get_buffer_size(ctx->sched, backend);
+        LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
+                ggml_backend_buft_name(buft),
+                size / 1024.0 / 1024.0);
+    }
+
+
+    // note: the number of splits during measure is higher than during inference due to the kv shift
+    int n_splits = ggml_backend_sched_get_n_splits(ctx->sched);
+    LLAMA_LOG_INFO("%s: graph splits (measure): %d\n", __func__, n_splits);
+}
+
 // find holes from the beginning of the KV cache and fill them by moving data from the end of the cache
 static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     /*
@@ -10348,7 +10423,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     const uint32_t n_layer = hparams.n_layer;
 
     const uint32_t n_kv   = llama_kv_cache_cell_max(kv_self);
-    const uint32_t n_used = kv_self.used;
+    const uint32_t n_used = kv_self->used;
 
     assert(n_used <= n_kv);
 
@@ -10366,7 +10441,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     std::vector<uint32_t> ids(n_kv, n_kv);
 
     for (uint32_t i0 = 0; i0 < n_used; ++i0) {
-        const auto & cell0 = kv_self.cells[i0];
+        const auto & cell0 = kv_self->cells[i0];
 
         if (!cell0.is_empty()) {
             ids[i0] = i0;
@@ -10379,7 +10454,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
         uint32_t nh = 1;
 
         // determine the size of the hole
-        while (i0 + nh < n_used && kv_self.cells[i0 + nh].is_empty()) {
+        while (i0 + nh < n_used && kv_self->cells[i0 + nh].is_empty()) {
             nh++;
         }
 
@@ -10397,7 +10472,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
 
         // starting from the end, find nh non-empty cells
         for (; is > i0; --is) {
-            const auto & cell1 = kv_self.cells[is];
+            const auto & cell1 = kv_self->cells[is];
 
             if (cell1.is_empty() || ids[is] != n_kv) {
                 continue;
@@ -10423,7 +10498,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
 
         // go back and move the nf cells to the hole
         for (; i1 < n_kv; ++i1) {
-            auto & cell1 = kv_self.cells[i1];
+            auto & cell1 = kv_self->cells[i1];
 
             if (cell1.is_empty() || ids[i1] != n_kv) {
                 cont = false;
@@ -10434,11 +10509,11 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
             ids[i1] = i0 + nf;
 
             // move the cell meta data
-            kv_self.cells[i0 + nf] = cell1;
+            kv_self->cells[i0 + nf] = cell1;
 
             // clear the old cell and move the head there
             cell1 = llama_kv_cell();
-            kv_self.head = n_used;
+            kv_self->head = n_used;
 
             if (!cont) {
                 n_moves++;
@@ -10480,23 +10555,23 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
     const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa();
     const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa();
 
-    const uint32_t kv_size = kv_self.size;
+    const uint32_t kv_size = kv_self->size;
 
     std::vector<uint8_t> buf_k;
     std::vector<uint8_t> buf_v;
 
     for (uint32_t il = 0; il < n_layer; ++il) {
-        const size_t k_size_row = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa);
-        const size_t k_size     = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*kv_size);
+        const size_t k_size_row = ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa);
+        const size_t k_size     = ggml_row_size(kv_self->k_l[il]->type, n_embd_k_gqa*kv_size);
 
-        const size_t v_size_el = ggml_type_size(kv_self.v_l[il]->type);
-        const size_t v_size    = ggml_row_size (kv_self.v_l[il]->type, n_embd_v_gqa*kv_size);
+        const size_t v_size_el = ggml_type_size(kv_self->v_l[il]->type);
+        const size_t v_size    = ggml_row_size (kv_self->v_l[il]->type, n_embd_v_gqa*kv_size);
 
         buf_k.resize(k_size);
         buf_v.resize(v_size);
 
-        ggml_backend_tensor_get(kv_self.k_l[il], buf_k.data(), 0, buf_k.size());
-        ggml_backend_tensor_get(kv_self.v_l[il], buf_v.data(), 0, buf_v.size());
+        ggml_backend_tensor_get(kv_self->k_l[il], buf_k.data(), 0, buf_k.size());
+        ggml_backend_tensor_get(kv_self->v_l[il], buf_v.data(), 0, buf_v.size());
 
         // batch move [i, i+nm) to [id, id+nm)
         // note: cells can move only to a lower index
@@ -10534,8 +10609,8 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
             i += nm - 1;
         }
 
-        ggml_backend_tensor_set(kv_self.k_l[il], buf_k.data(), 0, buf_k.size());
-        ggml_backend_tensor_set(kv_self.v_l[il], buf_v.data(), 0, buf_v.size());
+        ggml_backend_tensor_set(kv_self->k_l[il], buf_k.data(), 0, buf_k.size());
+        ggml_backend_tensor_set(kv_self->v_l[il], buf_v.data(), 0, buf_v.size());
     }
 #else
     // ggml_graph defrag
@@ -13950,6 +14025,7 @@ struct llama_model * llama_load_model_from_file_gpt4all(
     ggml_time_init();
 
     llama_model * model = new llama_model;
+    current_model = model;
 
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
@@ -14056,6 +14132,7 @@ struct llama_context * llama_new_context_with_model(
 
 
     llama_context * ctx = new llama_context(*model);
+    current_context = ctx;
 
     const auto & hparams = model->hparams;
     llama_cparams & cparams = ctx->cparams;
@@ -14269,11 +14346,11 @@ struct llama_context * llama_new_context_with_model(
             size_t memory_size_k = 0;
             size_t memory_size_v = 0;
 
-            for (auto & k : ctx->kv_self.k_l) {
+            for (auto & k : ctx->kv_self->k_l) {
                 memory_size_k += ggml_nbytes(k);
             }
 
-            for (auto & v : ctx->kv_self.v_l) {
+            for (auto & v : ctx->kv_self->v_l) {
                 memory_size_v += ggml_nbytes(v);
             }
 
@@ -14356,7 +14433,6 @@ struct llama_context * llama_new_context_with_model(
                 ggml_backend_buffer_get_size(ctx->buf_input) / 1024.0 / 1024.0);
 
         // buffer types used for the compute buffer of each backend
-        std::vector<ggml_backend_buffer_type_t> backend_buft;
         for (ggml_backend *backend : ctx->backends) {
             if (ggml_backend_is_cpu(backend)) {
                 // use host buffers for the CPU backend compute buffer
@@ -14374,35 +14450,10 @@ struct llama_context * llama_new_context_with_model(
             ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), LLAMA_MAX_NODES);
             LLAMA_LOG_INFO("%s: created new scheduler %p for context %p\n", __func__, ctx->sched, ctx);
 
-            // build worst-case graph
-            int n_tokens = (int)std::min(cparams.n_ctx, cparams.n_batch);
-            int n_past = cparams.n_ctx - n_tokens;
-            llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
-            ggml_cgraph * gf = llama_build_graph(*ctx, llama_batch_get_one(&token, n_tokens, n_past, 0), true);
-
-            // initialize scheduler with the worst-case graph
-            if (!ggml_backend_sched_reserve(ctx->sched, gf)) {
-                LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-                llama_free(ctx);
-                return nullptr;
-            }
 
         } else {
             ctx->sched = copyctx->sched;
         }
-        for (size_t i = 0; i < ctx->backends.size(); i++) {
-            ggml_backend *backend = ctx->backends[i];
-            ggml_backend_buffer_type_t buft = backend_buft[i];
-            size_t size = ggml_backend_sched_get_buffer_size(ctx->sched, backend);
-            LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
-                    ggml_backend_buft_name(buft),
-                    size / 1024.0 / 1024.0);
-        }
-
-
-        // note: the number of splits during measure is higher than during inference due to the kv shift
-        int n_splits = ggml_backend_sched_get_n_splits(ctx->sched);
-        LLAMA_LOG_INFO("%s: graph splits (measure): %d\n", __func__, n_splits);
     }
 
 #ifdef GGML_USE_MPI
@@ -14431,12 +14482,13 @@ struct llama_context * llama_new_context_with_model(
     model->contexts.push_back(ctx);
     */
     ctx->ctx_ready = true;
-    current_context = ctx;
     current_kb = (System_kb*)myPool.alloc(sizeof(System_kb));
-    current_kb->scheduler = ctx->sched;
-    current_kb->compute_meta = ctx->buf_compute_meta;
+    new (current_kb)  System_kb;
+    current_kb->prepare();
+    LLAMA_LOG_INFO("Initializing KB.\n");
     memcpy( &current_kb->hparams, &hparams, sizeof(hparams) );
-
+    current_kb->init(0, 1024);
+    LLAMA_LOG_INFO("current_kb initialized\n");
     return ctx;
 }
 
@@ -14618,8 +14670,8 @@ int32_t llama_model_apply_lora_from_file(const struct llama_model * model, const
 
 /*
 void llama_kv_cache_view_update(const struct llama_context * ctx, struct llama_kv_cache_view * view) {
-    if (uint32_t(view->n_cells) < ctx->kv_self.size || view->cells == nullptr) {
-        view->n_cells = int32_t(ctx->kv_self.size);
+    if (uint32_t(view->n_cells) < ctx->kv_self->size || view->cells == nullptr) {
+        view->n_cells = int32_t(ctx->kv_self->size);
         void * p = realloc(view->cells, sizeof(struct llama_kv_cache_view_cell) * view->n_cells);
         GGML_ASSERT(p != nullptr && "Failed to alloc kv_cache_view cells");
         view->cells = (struct llama_kv_cache_view_cell *)p;
@@ -14628,7 +14680,7 @@ void llama_kv_cache_view_update(const struct llama_context * ctx, struct llama_k
         view->cells_sequences = (llama_seq_id *)p;
     }
 
-    const std::vector<llama_kv_cell> & kv_cells = ctx->kv_self.cells;
+    const std::vector<llama_kv_cell> & kv_cells = ctx->kv_self->cells;
     llama_kv_cache_view_cell * c_curr = view->cells;
     llama_seq_id * cs_curr = view->cells_sequences;
     int32_t used_cells = 0;
@@ -14637,7 +14689,7 @@ void llama_kv_cache_view_update(const struct llama_context * ctx, struct llama_k
     uint32_t max_contig = 0;
     int32_t max_contig_idx = -1;
 
-    for (int32_t i = 0; i < int32_t(ctx->kv_self.size); i++, c_curr++, cs_curr += view->n_max_seq) {
+    for (int32_t i = 0; i < int32_t(ctx->kv_self->size); i++, c_curr++, cs_curr += view->n_max_seq) {
         const size_t curr_size = kv_cells[i].seq_id.size();
         token_count += curr_size;
         c_curr->pos = kv_cells[i].pos + kv_cells[i].delta;
@@ -14675,9 +14727,9 @@ void llama_kv_cache_view_update(const struct llama_context * ctx, struct llama_k
     view->max_contiguous_idx = max_contig_idx;
     view->token_count = token_count;
     view->used_cells = used_cells;
-    if (uint32_t(used_cells) != ctx->kv_self.used) {
+    if (uint32_t(used_cells) != ctx->kv_self->used) {
         LLAMA_LOG_ERROR("%s: used cells mismatch. kv_cache says %d but we calculated %d\n",
-            __func__, ctx->kv_self.used, used_cells);
+            __func__, ctx->kv_self->used, used_cells);
     }
 }
 */
@@ -14696,7 +14748,7 @@ size_t llama_get_state_size(const struct llama_context * ctx) {
     const size_t s_embedding       = ctx->embd.capacity() * sizeof(float);
     const size_t s_kv_buf_size     = sizeof(size_t);
     const size_t s_kv_used         = sizeof(uint32_t);
-    const size_t s_kv              = ctx->kv_self.total_size();
+    const size_t s_kv              = ctx->kv_self->total_size();
 
     const size_t s_total = (
         + s_rng_size
@@ -14826,24 +14878,24 @@ static void llama_copy_state_data_internal(struct llama_context * ctx, llama_dat
 
         size_t k_row        = 2048*kv_used;
         size_t v_row_size   = 2*kv_used;
-        size_t v_stride     = 2*kv_self.size;
+        size_t v_stride     = 2*kv_self->size;
 
         if (kv_used>0) {
             std::vector<uint8_t> tmp_buf;
             tmp_buf.resize(k_row);
             for (int il = 0; il < 32; ++il) {
-                ggml_backend_tensor_get(kv_self.k_l[il], tmp_buf.data(), 0, k_row);
+                ggml_backend_tensor_get(kv_self->k_l[il], tmp_buf.data(), 0, k_row);
                 data_ctx->write(tmp_buf.data(), k_row);
 
                 for (int ir = 0; ir < (int) 1024; ++ir) {
-                    ggml_backend_tensor_get(kv_self.v_l[il], tmp_buf.data()+ir*v_row_size, ir*v_stride, v_row_size);
+                    ggml_backend_tensor_get(kv_self->v_l[il], tmp_buf.data()+ir*v_row_size, ir*v_stride, v_row_size);
                 }
                 data_ctx->write(tmp_buf.data(), k_row); // compiled data will be == k_row size
                 data_ctx->write(&separator, 1); // separate each layer
             }
         }
 
-        //data_ctx->write( kv_self.inuse, 512 );
+        //data_ctx->write( kv_self->inuse, 512 );
         data_ctx->write(&separator, 1); // separate each layer
         data_ctx->DC_WRITE( ctx->sequential_start );
         data_ctx->DC_WRITE( ctx->seq_end );
@@ -14964,16 +15016,16 @@ size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
         } else {
             memcpy(&kv_used,     inp, sizeof(kv_used));     inp += sizeof(kv_used);
         }
-        kv_usable =( kv_used > kv_self.size ) ? kv_self.size : kv_used;
+        kv_usable =( kv_used > kv_self->size ) ? kv_self->size : kv_used;
 
         if( kv_usable < kv_used ) {
-            LLAMA_LOG_WARN("%s: kv_usable %lu < kv_used %lu, size %lu\n", __func__, kv_usable, kv_used, kv_self.size);
+            LLAMA_LOG_WARN("%s: kv_usable %lu < kv_used %lu, size %lu\n", __func__, kv_usable, kv_used, kv_self->size);
         } else {
-            LLAMA_LOG_INFO("%s: kv_usable %lu, kv_used %lu, size %lu\n", __func__, kv_usable, kv_used, kv_self.size);
+            LLAMA_LOG_INFO("%s: kv_usable %lu, kv_used %lu, size %lu\n", __func__, kv_usable, kv_used, kv_self->size);
         }
 
         if (kv_used > 0) {
-            size_t v_row_stride = 2*kv_self.size;
+            size_t v_row_stride = 2*kv_self->size;
             size_t v_row_size = 2*kv_used;
 
             size_t v_size_usable = 2*kv_usable;
@@ -14983,14 +15035,14 @@ size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
             size_t k_size_usable = 2048*kv_usable;
             size_t k_size_used = 2048*kv_used;
 
-            //LLAMA_LOG_INFO("%s: k_l size %d\n", __func__, ggml_element_size(kv_self.k_l[0]));
-            //LLAMA_LOG_INFO("%s: v_l size %d\n", __func__, ggml_element_size(kv_self.v_l[0]));
+            //LLAMA_LOG_INFO("%s: k_l size %d\n", __func__, ggml_element_size(kv_self->k_l[0]));
+            //LLAMA_LOG_INFO("%s: v_l size %d\n", __func__, ggml_element_size(kv_self->v_l[0]));
             for (int il = 0; il < (int) 32; ++il) {
-                ggml_backend_tensor_set(kv_self.k_l[il], inp+(k_size_used-k_size_usable), 0, k_size_usable);
+                ggml_backend_tensor_set(kv_self->k_l[il], inp+(k_size_used-k_size_usable), 0, k_size_usable);
                 inp += k_size;
 
                 for (int ir = 0; ir < (int) 1024; ++ir) {
-                    ggml_backend_tensor_set(kv_self.v_l[il], inp+(v_size_used-v_size_usable), ir*v_row_stride, v_size_usable);
+                    ggml_backend_tensor_set(kv_self->v_l[il], inp+(v_size_used-v_size_usable), ir*v_row_stride, v_size_usable);
                     inp += v_size_used;
                 }
 
@@ -15010,10 +15062,10 @@ size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
         /*
         if( version >= 2 ) {
             LLAMA_LOG_INFO("Read inuse ptr: %d bytes\n", 4096/8);
-            memcpy( kv_self.inuse, inp, kv_self.size/8 );
-            inp += kv_self.size/8;
+            memcpy( kv_self->inuse, inp, kv_self->size/8 );
+            inp += kv_self->size/8;
         } else {
-            ctx->kv_self.use_tokens(0, kv_used, true);
+            ctx->kv_self->use_tokens(0, kv_used, true);
         }
         */
 
@@ -15177,7 +15229,10 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
     if( !kv->players.contains(keyfor) ) {
         if( key == "self" ) {
             // create new actor with this self-key
+            LLAMA_LOG_INFO("%s: got self key for %s\n", __func__, keyfor.c_str());
             a = (System_actor*)myPool.alloc(sizeof(*a));
+            new (a) System_actor;
+            a->prepare();
             a->name = keyfor;
             a->loadfile(); // load in case the actor already exists
 
@@ -15555,21 +15610,21 @@ void llama_kv_cache_shift_fwd( struct llama_context *ctx, int fwd)
         memcpy((void*)((char*)nd2+i),&z,2);
     }
     for( int il=0; il<32; il++ ) {
-        ggml_backend_tensor_get(ctx->kv_self.k_l[il], nd, offset, moving_sz );
-        ggml_backend_tensor_set(ctx->kv_self.k_l[il], nd, offset+empty_sz, moving_sz );
+        ggml_backend_tensor_get(ctx->kv_self->k_l[il], nd, offset, moving_sz );
+        ggml_backend_tensor_set(ctx->kv_self->k_l[il], nd, offset+empty_sz, moving_sz );
         if( empty_sz != 0 )
-            ggml_backend_tensor_set(ctx->kv_self.k_l[il], nd2, offset, empty_sz);
+            ggml_backend_tensor_set(ctx->kv_self->k_l[il], nd2, offset, empty_sz);
 
         for( size_t k=0; k<buffer_sz; k+=8192 ) {
-            ggml_backend_tensor_get(ctx->kv_self.v_l[il], nd, k + v, moving_sz2 );
-            ggml_backend_tensor_set(ctx->kv_self.v_l[il], nd, k + s, moving_sz2 );
-            ggml_backend_tensor_set(ctx->kv_self.v_l[il], nd2, k + v, x );
+            ggml_backend_tensor_get(ctx->kv_self->v_l[il], nd, k + v, moving_sz2 );
+            ggml_backend_tensor_set(ctx->kv_self->v_l[il], nd, k + s, moving_sz2 );
+            ggml_backend_tensor_set(ctx->kv_self->v_l[il], nd2, k + v, x );
         }
     }
     myPool.release(nd2);
     myPool.release(nd);
 
-    //ctx->kv_self.use_tokens(ctx->sequential_start, fwd, false);
+    //ctx->kv_self->use_tokens(ctx->sequential_start, fwd, false);
     ctx->sequential_start += fwd;
     ctx->seq_end += fwd;
     /*
@@ -15598,7 +15653,7 @@ void llama_kv_cache_shift_rev( struct llama_context *ctx, int target, int skip, 
     int range = ctx->seq_end-readptr;
     if( range <= 0 ) {
         // just blank the area and reset the pointers
-        //ctx->kv_self.use_tokens(target, ctx->seq_end-target, false);
+        //ctx->kv_self->use_tokens(target, ctx->seq_end-target, false);
         ctx->seq_end = target;
         return;
     }
@@ -15606,7 +15661,7 @@ void llama_kv_cache_shift_rev( struct llama_context *ctx, int target, int skip, 
     llm.shuffle_kv_now( readptr, ctx->seq_end, -skip );
 
 
-    //ctx->kv_self.use_tokens(ctx->seq_end-skip, skip, false);
+    //ctx->kv_self->use_tokens(ctx->seq_end-skip, skip, false);
     ctx->seq_end -= skip;
 
     //llm.run_kv_shuffler();
@@ -15621,11 +15676,11 @@ void llama_kv_cache_shift_rev( struct llama_context *ctx, int target, int skip, 
 int llama_kv_cache_reserve( struct llama_context *ctx, int tokens )
 {
     tokens += 4;
-    if( ctx->seq_end + tokens <= ctx->kv_self.size ) return ctx->seq_end;
+    if( ctx->seq_end + tokens <= ctx->kv_self->size ) return ctx->seq_end;
 
     if( tokens < 256 ) tokens=256; // reserve enough tokens to finish a sentence at least...
 
-    llama_kv_cache_shift_rev( ctx, ctx->sequential_start, tokens, ctx->kv_self.size );
+    llama_kv_cache_shift_rev( ctx, ctx->sequential_start, tokens, ctx->kv_self->size );
     return ctx->seq_end;
 }
 
@@ -15634,8 +15689,8 @@ int32_t llama_decode(
         struct llama_batch   batch
         ) {
 
-    if( batch.n_tokens + ctx->seq_end > ctx->kv_self.size ) {
-        LLAMA_LOG_INFO("kv_cache_over: %d + %d > %d\n", batch.n_tokens, ctx->seq_end, ctx->kv_self.size);
+    if( batch.n_tokens + ctx->seq_end > ctx->kv_self->size ) {
+        LLAMA_LOG_INFO("kv_cache_over: %d + %d > %d\n", batch.n_tokens, ctx->seq_end, ctx->kv_self->size);
         return -1;
     }
 

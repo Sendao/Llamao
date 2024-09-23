@@ -33,41 +33,6 @@ void LLModel::prompt(const std::string &oldprompt,
     }
 
     std::string prompt=oldprompt;
-    std::string toname="all";
-
-    int save_start;
-
-    if( prompt.find("/save") != std::string::npos ) {
-        //later we can add saving to a specific place
-        saveActors();
-        return;
-    }
-
-    int pos, parampos;
-    std::string param;
-    pos = prompt.find("/unload");
-    if( pos != std::string::npos ) {
-        parampos = pos + 8;
-        int ipos = prompt.find("\n", parampos);
-        if( ipos == std::string::npos ) {
-            ipos = prompt.length();
-        }
-        param = prompt.substr(parampos, ipos-parampos);
-        unloadActor(param);
-        return;
-    }
-    pos = prompt.find("/to");
-    if( pos != std::string::npos ) {
-        parampos = pos + 4;
-
-        int ipos = prompt.find("\n", parampos);
-        if( ipos == std::string::npos ) {
-            ipos = prompt.length();
-        }
-        param = prompt.substr(parampos, ipos-parampos);
-        prompt = prompt.substr(0,parampos-4) + prompt.substr(ipos);
-        toname = param;
-    }
 
     if( prompt.starts_with("&") ) { // for manual loading of old memories
         // loading old memories
@@ -118,6 +83,41 @@ void LLModel::prompt(const std::string &oldprompt,
         return;
     }
 
+    std::string toname="all";
+
+    int save_start;
+
+    if( prompt.find("/save") != std::string::npos ) {
+        //later we can add saving to a specific place
+        saveActors();
+        return;
+    }
+
+    int pos, parampos;
+    std::string param;
+    pos = prompt.find("/unload");
+    if( pos != std::string::npos ) {
+        parampos = pos + 8;
+        int ipos = prompt.find("\n", parampos);
+        if( ipos == std::string::npos ) {
+            ipos = prompt.length();
+        }
+        param = prompt.substr(parampos, ipos-parampos);
+        unloadActor(param);
+        return;
+    }
+    pos = prompt.find("/to");
+    if( pos != std::string::npos ) {
+        parampos = pos + 4;
+
+        int ipos = prompt.find("\n", parampos);
+        if( ipos == std::string::npos ) {
+            ipos = prompt.length();
+        }
+        param = prompt.substr(parampos, ipos-parampos);
+        prompt = prompt.substr(0,parampos-4) + prompt.substr(ipos);
+        toname = param;
+    }
     int usernamepos = prompt.find("<|im_start|>");
     std::string fromname;
 
