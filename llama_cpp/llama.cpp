@@ -2591,6 +2591,12 @@ struct system_memory {
 
     //std::string where; // add with location
 
+    void prepare()
+    {
+        new (&what) std::string;
+        new (&who) std::string;
+        new (&keywords) std::set<std::string>;
+    }
     void release()
     {
         keywords.clear();
@@ -2629,17 +2635,23 @@ struct system_memory {
         wptr = word;
         *wptr = '\0';
 
-        for( instr = what.c_str() ;; instr++ ) {
-            if( *instr == ' ' || *instr == '\n' || !*instr ) {
+        LLAMA_LOG_INFO("%s: memory what=%s\n", __func__, what.c_str());
+
+        int iptr, len = what.length();
+        char c;
+
+        for( iptr=0; iptr<len; iptr++ ) {
+            c = what[iptr]; // = what.c_str() ;; instr++ ) {
+            if( c == ' ' || c == '\n' || !c ) {
                 if( *word != '\0' ) {
                     keywords.insert( std::string(word) );
                     wptr=word;
                     *wptr='\0';
                 }
-                if( !*instr ) break;
+                if( !c ) break;
             } else {
                 // if isalpha blah blah blah
-                *wptr = *instr; // to lowercase blah blah blah
+                *wptr = c; // to lowercase blah blah blah
                 wptr++;
             }
         }
@@ -2673,6 +2685,13 @@ struct system_eidet {
     std::string who;
     System_timestamp *when=NULL;
     //std::string where; // add with location
+
+    void prepare()
+    {
+        new (&what) std::string;
+        new (&who) std::string;
+        new (&keywords) std::set<std::string>;
+    }
 
     void release()
     {
@@ -2727,22 +2746,27 @@ struct system_eidet {
     }
     void buildsearch( void )
     {
-        const char *instr; // now index the words for search:
         char word[128], *wptr;
         wptr = word;
         *wptr = '\0';
 
-        for( instr = what.c_str() ;; instr++ ) {
-            if( *instr == ' ' || *instr == '\n' || !*instr ) {
+        LLAMA_LOG_INFO("%s: eidet what=%s\n", __func__, what.c_str());
+
+        int iptr, len = what.length();
+        char c;
+
+        for( iptr=0; iptr<len; iptr++ ) {
+            c = what[iptr]; // = what.c_str() ;; instr++ ) {
+            if( c == ' ' || c == '\n' || !c ) {
                 if( *word != '\0' ) {
                     keywords.insert( std::string(word) );
                     wptr=word;
                     *wptr='\0';
                 }
-                if( !*instr ) break;
+                if( !c ) break;
             } else {
                 // if isalpha blah blah blah
-                *wptr = *instr; // to lowercase blah blah blah
+                *wptr = c; // to lowercase blah blah blah
                 wptr++;
             }
         }
@@ -2774,6 +2798,9 @@ struct system_eidet {
     {
         System_memory *mem = (System_memory*)myPool.alloc(sizeof(*mem));
 
+        new (mem) System_memory;
+
+        mem->prepare();
         mem->who = who;
         mem->what = what;
         mem->when = (System_timestamp*)myPool.alloc(sizeof(*when));
@@ -2789,6 +2816,14 @@ typedef struct kv_mem {
     System_eidet *e=NULL;
     uint16_t first; // token location
     uint16_t last; // inclusive
+
+    void prepare()
+    {
+        m = NULL;
+        e = NULL;
+        is_full = false;
+        first = last = 0;
+    }
 
     System_timestamp *when()
     {
@@ -2809,9 +2844,13 @@ typedef struct kv_mem {
         first=last=0;
         if( type == 1 ) {
             m = (System_memory*)myPool.alloc(sizeof(*m));
+            new (m) System_memory;
+            m->prepare();
             m->readfile(file);
         } else if( type == 2 ) {
             e = (System_eidet*)myPool.alloc(sizeof(*e));
+            new (e) System_eidet;
+            e->prepare();
             e->readfile(file);
         } else {
             LLAMA_LOG_INFO("%s: wrong type %d", __func__, type);
@@ -2836,6 +2875,8 @@ typedef struct kv_mem {
 Kv_mem *new_kv_mem( System_memory *memory )
 {
     Kv_mem *m = (Kv_mem*)myPool.alloc(sizeof(*m));
+    new (m) Kv_mem;
+    m->prepare();
     m->m = memory;
     m->is_full = false;
     m->first = m->last = 0;
@@ -2844,6 +2885,8 @@ Kv_mem *new_kv_mem( System_memory *memory )
 Kv_mem *new_kv_mem( System_eidet *memory )
 {
     Kv_mem *m = (Kv_mem*)myPool.alloc(sizeof(*m));
+    new (m) Kv_mem;
+    m->prepare();
     m->e = memory;
     m->is_full = true;
     m->first = m->last = 0;
@@ -2886,12 +2929,16 @@ void loadmemories( const char *filepath, std::vector<Kv_mem*> &mems )
     if( datafile.fp == NULL ) {
         //! Todo: auto-write description
         // for now we'll just leave them blank.
+        LLAMA_LOG_INFO("%s: no file '%s'\n", __func__, filepath);
         return;
     }
     uint32_t count;
     count = datafile.read_u32();
+    LLAMA_LOG_INFO("%s: load %zu entries.\n", __func__, count);
     while( count > 0 ) {
         m = (Kv_mem*)myPool.alloc(sizeof(*m));
+        new (m) Kv_mem;
+        m->prepare();
         m->readfile(datafile);
         mems.push_back(m);
     }
@@ -2910,7 +2957,7 @@ void savememories( const char *filepath, std::vector<Kv_mem*> &mems )
 
 struct system_actor {
     std::string name;
-    System_eidet *self; // self description data
+    System_eidet *self=NULL; // self description data
     bool self_changed=false;
     std::vector<Kv_mem *> mem; // identity variables & persona variables
     bool mem_changed=false;
@@ -3030,6 +3077,8 @@ struct system_actor {
 
         if( playerfile.fp != NULL ) {
             self = (System_eidet*)myPool.alloc(sizeof(*self));
+            new (self) System_eidet;
+            self->prepare();
             self->readfile(playerfile);
         }
 
@@ -3037,6 +3086,8 @@ struct system_actor {
         loadmemories(mempath, mem);
         loadmemories(hstpath, history);
         loadmemories(rctpath, recent);
+
+        LLAMA_LOG_INFO("%s: load complete.\n", __func__);
 
         self_changed=rags_changed=mem_changed=false; // these refer to the on-disk details
     }
@@ -3081,22 +3132,29 @@ struct system_actor {
         Kv_mem *src;
         std::vector<Kv_mem*>::iterator it;
         std::vector<Kv_mem*> *res;
-        uint16_t token;
+        uint16_t token=0;
 
         res = (std::vector<Kv_mem*> *)myPool.alloc(sizeof(*res));
+        new (res) std::vector<Kv_mem*>;
 
-        me = (Kv_mem*)myPool.alloc(sizeof(*me));
-        me->e = self;
-        me->m = NULL;
-        me->first = 0; //! when we first translate the self memory we will need to record the BOS as well.
-        me->last = self->n_tokens-1;
-        token = me->last+1;
-        res->push_back( me );
+        if( self ) {
+            me = (Kv_mem*)myPool.alloc(sizeof(*me));
+            new (me) Kv_mem;
+            me->prepare();
+            me->e = self;
+            me->m = NULL;
+            me->first = 0; //! when we first translate the self memory we will need to record the BOS as well.
+            me->last = self->n_tokens-1;
+            token = me->last+1;
+            res->push_back( me );
+        }
 
         for( it = mem.begin(); it != mem.end(); it++ ) {
             src = *it;
 
             me = (Kv_mem*)myPool.alloc(sizeof(*me));
+            new (me) Kv_mem;
+            me->prepare();
             me->is_full = true;
             me->e = src->e;
             me->m = NULL;
@@ -3111,6 +3169,8 @@ struct system_actor {
             src = *it;
 
             me = (Kv_mem*)myPool.alloc(sizeof(*me));
+            new (me) Kv_mem;
+            me->prepare();
             me->is_full = false;
             me->e = NULL;
             me->m = src->m;
@@ -3124,21 +3184,28 @@ struct system_actor {
 
     void build_map2( uint16_t use_space, std::vector<Kv_mem*> *res )
     {
-        Kv_mem *me;
-        Kv_mem *src = res->at( res->size()-1 );
-        uint16_t token = src->last+1;
+        Kv_mem *me, *src;;
+        uint16_t token = 0;
+        LLAMA_LOG_INFO("%s: build map 2\n", __func__);
+        if( res->size() > 0 ) {
+            src = res->at( res->size()-1 );
+            token = src->last+1;
+        }
         std::vector<Kv_mem*>::iterator it;
         std::vector<Kv_mem*>::iterator itBoundary = res->end(), itBound2;
         uint16_t token_cpy = token;
 
         // insert history in reverse from end to beginning as far as we can go
-        for( it = recent.end(); it != recent.begin(); it-- ) {
+        for( it = recent.end(); it != recent.begin(); ) {
+            it--;
             src = *it;
 
             if( token+src->e->n_tokens > use_space ) break;
             token += src->e->n_tokens;
 
             me = (Kv_mem*)myPool.alloc(sizeof(*me));
+            new (me) Kv_mem;
+            me->prepare();
             me->is_full = true;
             me->e = src->e;
             me->m = NULL;
@@ -3146,8 +3213,12 @@ struct system_actor {
             res->insert( itBoundary, me );
         }
         itBound2 = history.end();
-        while( it >= recent.begin() ) { // move overflow to history
+        while( it != recent.begin() ) { // move overflow to history
+            it--;
+            src = *it;
             me = (Kv_mem*)myPool.alloc(sizeof(*me));
+            new (me) Kv_mem;
+            me->prepare();
             me->is_full = false;
             me->e = NULL;
             me->m = (System_memory*)myPool.alloc(sizeof(*(me->m)));
@@ -3155,9 +3226,6 @@ struct system_actor {
             history.insert(itBound2, me);
 
             recent.erase(it);
-            it--;
-            if( it < recent.begin() ) break;
-            src = *it;
         }
 
         token = token_cpy; // final token count & organize results:
@@ -3167,6 +3235,7 @@ struct system_actor {
             token += src->e->n_tokens;
             src->last = token - 1;
         }
+        LLAMA_LOG_INFO("%s: done\n", __func__);
     }
 };
 
@@ -3519,6 +3588,7 @@ struct system_kb {
 
         // decide where everything goes
         int token=0;
+        LLAMA_LOG_INFO("%s: map has %d entries.\n", __func__, map->size());
         for( it = map->begin(); it != map->end(); it++ ) {
             eid = *it;
             if( eid->first == 0 ) {
@@ -3623,6 +3693,7 @@ struct system_kb {
             }
         }
 
+        LLAMA_LOG_INFO("%s: prepare llm for shift\n", __func__);
         Org_context llm(&kv[kvno], current_context->buf_compute_meta, current_context->sched, hparams);
         bool initialized=false;
         // finish by moving memories that can be shuffled around
@@ -3641,6 +3712,7 @@ struct system_kb {
             }
         }
         if( initialized ) {
+            LLAMA_LOG_INFO("%s: run shuffler\n", __func__);
             llm.run_kv_shuffler();
             llm.free();
         }
@@ -3835,6 +3907,8 @@ struct system_kb {
         Kv_mem *mem;
         for( int j=0; j<3; j++ ) {
             System_eidet *eid = (System_eidet*)myPool.alloc(sizeof(*eid));
+            new (eid) System_eidet;
+            eid->prepare();
 
             // read from current_kv and build eidet
             eid->build(&(kv[tgt_kv]), fromname, message, startpt, tokens.size());
@@ -3873,6 +3947,9 @@ struct system_kb {
     {
         System_actor *a = current_kb->getactor(actor);
         System_memory *m = (System_memory*)myPool.alloc(sizeof(*m));
+        new (m) System_memory;
+        m->prepare();
+
         m->who = who;
         m->what = what;
         if( when == "" ) {
@@ -7291,7 +7368,7 @@ struct llm_build_context {
         struct ggml_tensor * cur;
         struct ggml_tensor * inpL;
 
-        LLAMA_LOG_INFO("build_inp_embd\n");
+        //LLAMA_LOG_INFO("build_inp_embd\n");
         inpL = llm_build_inp_embd(ctx0, hparams, batch, model.tok_embd, lctx.inp_tokens, lctx.inp_embd, cb);
         cb(inpL, "inp_embd", -1);
 
@@ -7312,7 +7389,7 @@ struct llm_build_context {
             out_embd = ggml_view_1d(ctx0, model.output_embd, 32*4096, 0);
             LLAMA_LOG_INFO("%s: out_embd type = %s, size = %d\n", __func__, ggml_type_name(out_embd->type), ggml_type_size(out_embd->type));
         } else {
-            LLAMA_LOG_INFO("build_layers\n");
+            //LLAMA_LOG_INFO("build_layers\n");
         }
 
         for (int il = 0; il < n_layer; ++il) {
@@ -15234,17 +15311,18 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
             new (a) System_actor;
             a->prepare();
             a->name = keyfor;
+            LLAMA_LOG_INFO("%s: load files for %s\n", __func__, keyfor.c_str());
             a->loadfile(); // load in case the actor already exists
 
             kv->players[keyfor] = a;
             kv->actors.push_back(a);
 
             // set the self-key on that actor
-            llama_set_key(ctx, keyfor, "self", keyval);
+            // just continue llama_set_key(ctx, keyfor, "self", keyval);
         } else {
             LLAMA_LOG_INFO("%s: not found player %s\n", __func__, keyfor.c_str());
+            return;
         }
-        return;
     }
 
     a = kv->players[ keyfor ];
@@ -15277,6 +15355,7 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
     Kv_mem *mem = kv->processtokens(tgt, "self", keyval, tokens);
     if( key == "self" ) {
         a->self = mem->e;
+        myPool.release(mem);
     } else {
         a->keys[key] = mem;
     }

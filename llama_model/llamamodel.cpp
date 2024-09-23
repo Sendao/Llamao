@@ -558,7 +558,7 @@ void LLamaModel::saveActors(void)
 {
     llama_save_actors();
 }
-void LLamaModel::setKey(std::string key, std::string keyfor, std::string keyval)
+void LLamaModel::setKey(std::string keyfor, std::string key, std::string keyval)
 {
     llama_set_key(d_ptr->ctx, keyfor, key, keyval);
 }
