@@ -34,7 +34,7 @@ void LLModel::prompt(const std::string &oldprompt,
 
     std::string prompt=oldprompt;
 
-    if( prompt.starts_with("&") ) { // for manual loading of old memories
+    if( prompt[0] == '&' ) { // for manual loading of old memories
         // loading old memories
         long ipos, npos, tpos, epos;
         uint32_t count;
@@ -48,12 +48,12 @@ void LLModel::prompt(const std::string &oldprompt,
         ipos = prompt.find("\n", npos+1); // &<actor>\n
         while( ipos != std::string::npos && ipos < prompt.length() ) {
             npos = prompt.find("\n", ipos); // <name>\n<when>:<message>"<store_end>"...
-            name = prompt.substr(1, npos-1);
+            name = prompt.substr(ipos+1, npos-(ipos+1));
             tpos = prompt.find(":", npos);
             when = prompt.substr(npos+1, tpos-(npos+1));
             ipos = prompt.find("<store_end>", npos);
             value = prompt.substr(tpos+1, ipos-(tpos+1) );
-            if( ipos != std::string::npos ) ipos += 11;
+            if( ipos != std::string::npos ) ipos += 10;
             if( count < 10 )
                 std::cerr << "recordMemory(" << actor << "," << name << "," << when << "," << value << ")\n";
             recordMemory(actor, name, when, value);
@@ -77,7 +77,7 @@ void LLModel::prompt(const std::string &oldprompt,
         } else {
             keyfor = "all";
         }
-        keyval = prompt.substr(seppos+1);
+        keyval = prompt.substr(linepos+1);
         setKey(keyfor, key, keyval);
 
         return;
@@ -129,6 +129,7 @@ void LLModel::prompt(const std::string &oldprompt,
         fromname = "user";
         std::cerr << "info: couldn't find fromname\n";
     }
+    std::cerr << fromname << " fromname\n";
 
     if( prompt.compare("_fulldata") == 0 ) {
         toggleFull(2);
@@ -151,18 +152,20 @@ void LLModel::prompt(const std::string &oldprompt,
 
     //std::cerr << "LLModel reading prompt " << prompt << "\n";
     // tokenize the user prompt
-    std::vector<Token> embd_inp;
-    embd_inp = tokenize(promptCtx, prompt, special);
+    //std::vector<Token> embd_inp;
+    //embd_inp = tokenize(promptCtx, prompt, special);
 
     // decode the user prompt
-    decodePrompt(promptCallback, responseCallback, promptCtx, embd_inp, fromname, toname);
+    int n_last_batch = decodePrompt(promptCallback, responseCallback, promptCtx, fromname, toname, prompt);
+
+    std::cerr << "decodePrompt complete\n";
 
     // decode the assistant's reply, either generated or spoofed
     if (fakeReply == nullptr) {
-        generateResponse(responseCallback, promptCtx, fromname, toname);
+        generateResponse(responseCallback, promptCtx, fromname, toname, n_last_batch);
     } else {
-        embd_inp = tokenize(promptCtx, *fakeReply, false);
-        decodePrompt(promptCallback, responseCallback, promptCtx, embd_inp, fromname, toname);
+        //embd_inp = tokenize(promptCtx, *fakeReply, false);
+        decodePrompt(promptCallback, responseCallback, promptCtx, fromname, toname, *fakeReply);
     }
 }
 
@@ -224,12 +227,13 @@ void LLModel::idle_prompt(std::function<bool(int32_t, int, int, float*, float*)>
 }
     */
 
-void LLModel::decodePrompt(std::function<bool(int32_t, int, int, float*, float*)> promptCallback,
+int LLModel::decodePrompt(std::function<bool(int32_t, int, int, float*, float*)> promptCallback,
                            std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
                            PromptContext &promptCtx,
-                           std::vector<Token> tokens, //embd_inp,
+                           //std::vector<Token> tokens, //embd_inp,
                            std::string fromname,
-                           std::string toname) {
+                           std::string toname,
+                           std::string prompt) {
     // save the context size
     promptCtx.n_ctx = contextLength();
 
@@ -285,12 +289,14 @@ void LLModel::decodePrompt(std::function<bool(int32_t, int, int, float*, float*)
         promptCtx.n_past += tokens;
     }
     */
-    std::string empty = "";
-    evalTokens(empty, tokens, fromname, toname);
+    //std::string empty = "";
+    std::vector<int> tokens;
+    return evalTokens(prompt, tokens, fromname, toname);
 }
 
 void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
-                               PromptContext &promptCtx, std::string fromname, std::string toname) {
+                               PromptContext &promptCtx, std::string fromname, std::string toname,
+                               int n_last_batch) {
     std::string cachedResponse;
     std::string end_literal = "<|im_end|>";
     std::string new_literal = "<|im_start|>";
@@ -320,23 +326,25 @@ void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, i
     bool gen_new=false;
     bool finished_gen=false;
     std::vector<int> newTokens;
-    std::string activename;
+    std::string activename="System";
     bool sendToAll=false;
 
     if( toname == "all" ) {
         sendToAll=true;
     }
 
-    std::cerr << "genResponse(" << n_gen << ": predict " << promptCtx.n_predict << ", " << promptCtx.continuing << " " << promptCtx.per_idle << ")\n";
+    std::cerr << "genResponse(" << n_gen << ": predict " << promptCtx.n_predict << ")\n";
     for (i = 0; i < n_gen; i++) {
         //std::cerr << "tokens.size() = " << promptCtx.tokens.size() << "\n";
-        // sample next token
-        auto id = sampleToken(promptCtx);
         feedData( promptCtx.logits, promptCtx.embds );
+        std::cerr << "sampleToken n_last_batch=" << n_last_batch << "\n";
+        auto id = sampleToken(promptCtx, n_last_batch);
         newTokens.clear();
         newTokens.push_back(id);
-        const std::string str = tokenToString(id); //std::cerr << "gen: " << str << "(" << id << ")\n";
-        if (!evalTokens(str, newTokens, activename, toname)) {
+        std::cerr << "tokenToString(" << id << ")\n";
+        const std::string str = tokenToString(id);
+        std::cerr << "gen: " << str << "(" << id << ")\n";
+        if( (n_last_batch=evalTokens(str, newTokens, activename, toname)) == 0 ) {
             std::cerr << implementation().modelType() << " ERROR: Failed to predict next token\n";
             id = 32000; // end
         }
@@ -384,6 +392,8 @@ void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, i
                 std::cerr << "new_literal found buf\n";
 
                 // generate new messenger
+                pickActor("System");
+                activename = "System";
                 finished_gen=false;
                 gen_new=true;
                 if( buf.length() > new_literal.length() ) {
@@ -426,8 +436,12 @@ void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, i
                     break;
                 }
             }
+            tokenbuf.clear();
+            logitbuf.clear();
+            embdbuf.clear();
 
             if( ending ) break;
+            continue;
         }
 
         // share with cb
@@ -439,7 +453,9 @@ void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, i
         }
 
         if( generatedTokens > 0 && buf.ends_with(end_literal) ) {
-            promptCtx.n_predict = 0;
+            pickActor("System");
+            activename="System";
+            //promptCtx.n_predict = 0;
             i = 0;
             if( !sendToAll ) { // normal termination
                 break;

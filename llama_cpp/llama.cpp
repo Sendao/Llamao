@@ -2012,14 +2012,20 @@ typedef struct llama_kv_cache {
 
         size_t p,q; // mind 'em
 
+        size_t p_sz = 2 * size;
+
+        LLAMA_LOG_INFO("kv_read: startpt %d n_tokens %zu\n", startpt, n_tokens);
+
         for( int il=0, bufptr=0; il<32; il++, bufptr += k ) {
             ggml_backend_tensor_get(k_l[il], (void*)((char*)kx + bufptr), st_k, k );
         }
-        for( int i=0, p=q=0; i<1024; i++, p += 8192, q += v ) {
-            for( int il=0, bufptr=0; il<32; il++, bufptr += k ) {
+        for( int i=0, p=q=0; i<1024; i++, p += p_sz, q += v ) {
+            for( int il=0, bufptr=0; il<32; il++, bufptr += v ) {
                 ggml_backend_tensor_get(v_l[il], (void*)((char*)vx + bufptr + q), st_v+p, v );
             }
         }
+
+        //ggml_backend_synchronize(current_context->backend_res);
     }
 
     /*
@@ -2048,11 +2054,15 @@ typedef struct llama_kv_cache {
         size_t st_k = 1024 * st_v;
 
         size_t p,q; // mind 'em
+        size_t p_sz = size*2;
+
+        LLAMA_LOG_INFO("kv_write: startpt %d n_tokens %zu\n", startpt, n_tokens);
 
         for( int il=0, bufptr=0; il<32; il++, bufptr += k*n_tokens ) {
             ggml_backend_tensor_set(k_l[il], (void*)((char*)kx + bufptr), st_k, k );
         }
-        for( int i=0, p=q=0; i<1024; i++, p += 8192, q += v ) {
+        for( int i=0, p=q=0; i<1024; i++, p += p_sz, q += v ) {
+            bufptr = 0;
             for( int il=0, bufptr=0; il<32; il++, bufptr += k*n_tokens ) {
                 ggml_backend_tensor_set(v_l[il], (void*)((char*)vx + bufptr + q), st_v+p, v );
             }
@@ -2582,6 +2592,18 @@ System_timestamp *llama_string_to_ts( std::string str )
     return ts;
 }
 
+char toLowerCase(char c)
+{
+    char a = 'a', A = 'A', Z = 'Z';
+
+    if( c >= A && c <= Z ) {
+        return c - (A-a);
+    }
+    return c;
+}
+
+
+
 struct system_memory {
     std::set<std::string> keywords;
 
@@ -2642,18 +2664,25 @@ struct system_memory {
 
         for( iptr=0; iptr<len; iptr++ ) {
             c = what[iptr]; // = what.c_str() ;; instr++ ) {
-            if( c == ' ' || c == '\n' || !c ) {
+            if( c == ' ' || c == '\n' || c == '\0' ) {
                 if( *word != '\0' ) {
+                    *wptr='\0';
                     keywords.insert( std::string(word) );
                     wptr=word;
                     *wptr='\0';
                 }
                 if( !c ) break;
             } else {
-                // if isalpha blah blah blah
-                *wptr = c; // to lowercase blah blah blah
+                *wptr = toLowerCase(c);
                 wptr++;
             }
+        }
+        if( *word != '\0' ) {
+            *wptr='\0';
+            //LLAMA_LOG_INFO("%s: add keyword %s\n", __func__, word);
+            keywords.insert( std::string(word) );
+            wptr=word;
+            *wptr='\0';
         }
     }
 
@@ -2757,8 +2786,10 @@ struct system_eidet {
 
         for( iptr=0; iptr<len; iptr++ ) {
             c = what[iptr]; // = what.c_str() ;; instr++ ) {
-            if( c == ' ' || c == '\n' || !c ) {
+            if( c == ' ' || c == '\n' || c == 0 ) {
                 if( *word != '\0' ) {
+                    *wptr='\0';
+                    //LLAMA_LOG_INFO("%s: add keyword %s\n", __func__, word);
                     keywords.insert( std::string(word) );
                     wptr=word;
                     *wptr='\0';
@@ -2769,6 +2800,13 @@ struct system_eidet {
                 *wptr = c; // to lowercase blah blah blah
                 wptr++;
             }
+        }
+        if( *word != '\0' ) {
+            *wptr='\0';
+            //LLAMA_LOG_INFO("%s: add keyword %s\n", __func__, word);
+            keywords.insert( std::string(word) );
+            wptr=word;
+            *wptr='\0';
         }
     }
 
@@ -2872,26 +2910,10 @@ typedef struct kv_mem {
     }
 } Kv_mem;
 
-Kv_mem *new_kv_mem( System_memory *memory )
-{
-    Kv_mem *m = (Kv_mem*)myPool.alloc(sizeof(*m));
-    new (m) Kv_mem;
-    m->prepare();
-    m->m = memory;
-    m->is_full = false;
-    m->first = m->last = 0;
-    return m;
-}
-Kv_mem *new_kv_mem( System_eidet *memory )
-{
-    Kv_mem *m = (Kv_mem*)myPool.alloc(sizeof(*m));
-    new (m) Kv_mem;
-    m->prepare();
-    m->e = memory;
-    m->is_full = true;
-    m->first = m->last = 0;
-    return m;
-}
+Kv_mem *new_kv_mem( void );
+Kv_mem *new_kv_mem( System_memory *memory );
+Kv_mem *new_kv_mem( System_eidet *memory );
+
 void llama_backup_file( const char *filepath )
 {
     FILE *fp;
@@ -2936,9 +2958,7 @@ void loadmemories( const char *filepath, std::vector<Kv_mem*> &mems )
     count = datafile.read_u32();
     LLAMA_LOG_INFO("%s: load %zu entries.\n", __func__, count);
     while( count > 0 ) {
-        m = (Kv_mem*)myPool.alloc(sizeof(*m));
-        new (m) Kv_mem;
-        m->prepare();
+        m = new_kv_mem();
         m->readfile(datafile);
         mems.push_back(m);
     }
@@ -2970,11 +2990,12 @@ struct system_actor {
 
     void prepare(void)
     {
-        new (&mem)     std::vector<Kv_mem *>; // identity variables & persona variables
+        new (&mem) std::vector<Kv_mem *>; // identity variables & persona variables
         new (&rags) std::vector<Kv_mem *>;
         new (&history) std::vector<Kv_mem *>; // things you have seen happen long ago (used for pulling RAG)
         new (&recent) std::vector<Kv_mem *>;
         new (&keys) std::unordered_map<std::string, Kv_mem*>;
+        self_changed=rags_changed=mem_changed=false;
     }
 
     void release()
@@ -3138,26 +3159,17 @@ struct system_actor {
         new (res) std::vector<Kv_mem*>;
 
         if( self ) {
-            me = (Kv_mem*)myPool.alloc(sizeof(*me));
-            new (me) Kv_mem;
-            me->prepare();
-            me->e = self;
-            me->m = NULL;
+            me = new_kv_mem(self);
             me->first = 0; //! when we first translate the self memory we will need to record the BOS as well.
             me->last = self->n_tokens-1;
-            token = me->last+1;
+            token = self->n_tokens;
             res->push_back( me );
         }
 
         for( it = mem.begin(); it != mem.end(); it++ ) {
             src = *it;
 
-            me = (Kv_mem*)myPool.alloc(sizeof(*me));
-            new (me) Kv_mem;
-            me->prepare();
-            me->is_full = true;
-            me->e = src->e;
-            me->m = NULL;
+            me = new_kv_mem(src->e);
             me->first = token;
             me->last = token + src->e->n_tokens-1;
             token = me->last+1;
@@ -3168,12 +3180,7 @@ struct system_actor {
         for( it = rags.begin(); it != rags.end(); it++ ) {
             src = *it;
 
-            me = (Kv_mem*)myPool.alloc(sizeof(*me));
-            new (me) Kv_mem;
-            me->prepare();
-            me->is_full = false;
-            me->e = NULL;
-            me->m = src->m;
+            me = new_kv_mem(src->m);
             me->first = me->last = 0;
 
             res->push_back( me );
@@ -3203,25 +3210,16 @@ struct system_actor {
             if( token+src->e->n_tokens > use_space ) break;
             token += src->e->n_tokens;
 
-            me = (Kv_mem*)myPool.alloc(sizeof(*me));
-            new (me) Kv_mem;
-            me->prepare();
-            me->is_full = true;
-            me->e = src->e;
-            me->m = NULL;
-
+            me = new_kv_mem(src->e);
             res->insert( itBoundary, me );
         }
         itBound2 = history.end();
         while( it != recent.begin() ) { // move overflow to history
             it--;
             src = *it;
-            me = (Kv_mem*)myPool.alloc(sizeof(*me));
-            new (me) Kv_mem;
-            me->prepare();
-            me->is_full = false;
-            me->e = NULL;
-            me->m = (System_memory*)myPool.alloc(sizeof(*(me->m)));
+            me = new_kv_mem((System_memory*)myPool.alloc(sizeof(*(me->m))));
+            new (me->m) System_memory;
+            me->m->prepare();
             me->m->build( src->e->who, src->e->what );
             history.insert(itBound2, me);
 
@@ -3425,12 +3423,14 @@ struct llama_context {
 };
 
 void prepare_kv_cache(struct llama_context *ctx, int n_ctx, int n_batch);
+void llama_quick_tokenize( std::string raw_text, std::vector<llama_vocab::id> &output );
 
 typedef struct system_kb System_kb;
 struct system_kb {
     std::vector<System_actor*> actors;
     std::unordered_map<std::string, System_actor*> players;
     std::unordered_map<std::string, std::vector<Kv_mem*>> ragwordmap;
+    std::vector<Kv_mem*> allmessages;
     struct llama_kv_cache kv[3];
 
     uint16_t kv_extent[3] = {0,0,0};
@@ -3438,6 +3438,15 @@ struct system_kb {
     std::vector<Kv_mem*> *kvmap[3] = {NULL,NULL,NULL};
     System_actor *kvuser[3] = {NULL,NULL,NULL};
     bool kv_ready[3] = {false,false,false};
+    uint8_t current_kv;
+
+    Kv_mem *getmem(void)
+    {
+        Kv_mem *memitem = (Kv_mem*)myPool.alloc(sizeof(Kv_mem));
+        memitem->prepare();
+        allmessages.push_back(memitem);
+        return memitem;
+    }
 
     void prepare(void)
     {
@@ -3492,48 +3501,6 @@ struct system_kb {
             myPool.release(a);
         }
     }
-    void init(int n, int n_ctx)
-    {
-        if( kv_ready[n] ) {
-            LLAMA_LOG_INFO("%s: already prepared %d\n", __func__, n);
-            return;
-        }
-
-        kv_extent[n] = n_ctx;
-        LLAMA_LOG_INFO("%s: preparing kv %d\n", __func__, n);
-        kv[n].prepare();
-        LLAMA_LOG_INFO("%s: prepared kv %d\n", __func__, n);
-
-        if (!llama_kv_cache_init((kv[n]), *current_model,
-                GGML_TYPE_F16, GGML_TYPE_F16, kv_context*n_ctx,
-                true)) {
-            LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
-            throw "Could not allocate kv cache.";
-        }
-
-        current_context->kv_self = &(kv[n]);
-        prepare_kv_cache(current_context, n_ctx, n_batch);
-
-        seq_start[n] = 0;
-
-        size_t memory_size_k = 0;
-        size_t memory_size_v = 0;
-
-        for (auto & k : kv[n].k_l) {
-            memory_size_k += ggml_nbytes(k);
-        }
-        for (auto & v : kv[n].v_l) {
-            memory_size_v += ggml_nbytes(v);
-        }
-
-        LLAMA_LOG_INFO("%s: KV[%d] self size  = %7.2f MiB, K (f16): %7.2f MiB, V (f16): %7.2f MiB\n", __func__,
-                       n,
-            (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f),
-            (float)memory_size_k / (1024.0f * 1024.0f),
-            (float)memory_size_v / (1024.0f * 1024.0f));
-
-        kv_ready[n] = true;
-    }
 
     void release()
     {
@@ -3568,10 +3535,57 @@ struct system_kb {
 
     struct llama_kv_cache *usekv( int kvno )
     {
-        init(kvno, kvno==0?1024:4096);
+        if( current_kv == kvno ) return &(kv[kvno]);
+        current_kv = kvno;
 
+        LLAMA_LOG_INFO("%s: use kv %d (actor %s)\n", __func__, kvno, kvno==0?"System":kvuser[kvno]->name.c_str());
+
+        if( !kv_ready[kvno] ) {
+            int n = kvno;
+            int n_ctx = n==0?1024:4096;
+
+            kv_extent[n] = n_ctx;
+            LLAMA_LOG_INFO("%s: preparing kv %d\n", __func__, n);
+            kv[n].prepare();
+            LLAMA_LOG_INFO("%s: prepared kv %d\n", __func__, n);
+
+            current_context->kv_self = &(kv[n]);
+            current_context->cparams.n_ctx = kv_extent[n];
+
+            if (!llama_kv_cache_init((kv[n]), *current_model,
+                    GGML_TYPE_F16, GGML_TYPE_F16, kv_context*n_ctx,
+                    true)) {
+                LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
+                throw "Could not allocate kv cache.";
+            }
+
+            current_context->kv_self = &(kv[n]);
+            prepare_kv_cache(current_context, n_ctx, n_batch);
+
+            seq_start[n] = 0;
+
+            size_t memory_size_k = 0;
+            size_t memory_size_v = 0;
+
+            for (auto & k : kv[n].k_l) {
+                memory_size_k += ggml_nbytes(k);
+            }
+            for (auto & v : kv[n].v_l) {
+                memory_size_v += ggml_nbytes(v);
+            }
+
+            LLAMA_LOG_INFO("%s: KV[%d] self size  = %7.2f MiB, K (f16): %7.2f MiB, V (f16): %7.2f MiB\n", __func__,
+                           n,
+                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f),
+                (float)memory_size_k / (1024.0f * 1024.0f),
+                (float)memory_size_v / (1024.0f * 1024.0f));
+
+            kv_ready[n] = true;
+        } else {
+            current_context->kv_self = &(kv[kvno]);
+            current_context->cparams.n_ctx = kv_extent[kvno];
+        }
         current_context->seq_end = seq_start[kvno];
-        current_context->kv_self = &(kv[kvno]);
 
         return &kv[kvno];
     }
@@ -3744,6 +3758,7 @@ struct system_kb {
 
         if( is_system_user ) {
             tgt_kv=0;
+            kvuser[0] = a;
         } else if( kvuser[1] == a ) {
             tgt_kv=1;
         } else if( kvuser[2] == a ) {
@@ -3759,11 +3774,10 @@ struct system_kb {
             kvuser[tgt_kv] = a;
         }
 
-        uint16_t reserve_space=400;
-        if( !kv_ready[tgt_kv] )
-            init(tgt_kv, is_system_user?1024:4096);
+        uint16_t reserve_space=440;
+        usekv(tgt_kv);
         if( kv[tgt_kv].size <= 1024 )
-            reserve_space = 200;
+            reserve_space = 330;
 
         uint16_t use_space = kv[tgt_kv].size - reserve_space;
 
@@ -3795,36 +3809,34 @@ struct system_kb {
         if( !found )
             tgt_kv = useactor(act->name);
 
-        usekv(tgt_kv);
-
-        uint16_t seq_start = kv[tgt_kv].seq;
-
-        if( !processtokens(tgt_kv, mem->who, mem->what, tokens) )
+        Kv_mem *newmem;
+        if( !(newmem=processtokens(tgt_kv, mem->who, mem->what, tokens)) )
         {
             LLAMA_LOG_INFO("%s: failed to translate %s\n", __func__, mem->what.c_str());
             throw "Couldn't translate tokens\n";
         }
 
-        System_eidet *eid = (System_eidet*)myPool.alloc(sizeof(*eid));
-        eid->what = mem->what;
-        eid->n_tokens = tokens.size();
-        eid->build(&kv[tgt_kv], act->name, eid->what, seq_start, kv[tgt_kv].seq);
-        return eid;
+        return newmem->e;
     }
 
     // process_tokens sends a message to all agents
-    void process_tokens( std::string toname, std::string fromname, std::string message, std::vector<llama_token> &tokens )
+    int process_tokens( std::string toname, std::string fromname, std::string message, std::vector<llama_token> &tokens )
     {
         std::set<System_actor*> messaged;
         System_actor *a;
 
         if( fromname.length() == 0 ) {
-            fromname = active_actor;
+            LLAMA_LOG_INFO("%s: Specify who message is from.\n", __func__);
+            return 0;
         }
-        if( fromname.length() == 0 ) {
-            LLAMA_LOG_INFO("%s: Specify who to send message to.\n", __func__);
-            return;
+
+        if( tokens.size() == 0 ) {
+            llama_quick_tokenize( message, tokens );
         }
+
+        int batches = floor(tokens.size()/64.0);
+        int n_last_batch = tokens.size() - 64 * batches;
+        LLAMA_LOG_INFO("%s: n_last_batch=%d\n", __func__, n_last_batch);
 
         if( toname != "all" ) {
 
@@ -3833,7 +3845,7 @@ struct system_kb {
             bool found=false;
 
             for( i=0;i<3;i++ ) {
-                if( kvuser[i] != NULL && kvuser[i]->name == toname ) {
+                if( kvuser[i]->name == toname && kvuser[i] != NULL ) {
                     found=true;
                     tgt_kv = i;
                     break;
@@ -3845,19 +3857,29 @@ struct system_kb {
 
             uint16_t seq_start = kv[tgt_kv].seq;
             processtokens(tgt_kv, fromname, message, tokens);
-            return;
+            return n_last_batch;
         }
+        uint8_t active_kv=0;
 
         for( int tgt=0; tgt<3; tgt++ ) {
             if( kv_ready[tgt] ) {
+                if( kvuser[tgt]->name == active_actor ) {
+                    active_kv = tgt;
+                }
                 processtokens(tgt, fromname, message, tokens); // fully process
                 if( tgt != 0 )
                     messaged.insert( kvuser[tgt] );
             }
         }
 
+        // make sure the context has the active actor as the current kv cache
+        usekv(active_kv);
+
+
         std::vector<System_actor*>::iterator it; // just say that we're sending it since they're not active yet
         System_memory *m = (System_memory*)myPool.alloc(sizeof(*m));
+        new (m) System_memory;
+        m->prepare();
         m->build(fromname, message);
 
         for( it = actors.begin(); it != actors.end(); it++ ) {
@@ -3866,27 +3888,30 @@ struct system_kb {
             a = *it;
             a->addhist(m);
         }
+        return n_last_batch;
     }
 
     // processtokens sends a message to one agent
     Kv_mem *processtokens(uint8_t tgt_kv, std::string fromname, std::string message,
                           std::vector<llama_token> &tokens, bool iskey=false)
     {
-        size_t i = 0;
-        int n_batch = 48;
+        size_t i;
+        int n_batch = 64;
         uint16_t startpt;
 
         usekv(tgt_kv);
 
-        if( tokens.size() == 0 ) // convert to embedding
-            llama_tokenstr(current_model, message, tokens, false);
-
-        if( seq_start[tgt_kv] == 0 )
+        if( tokens.size() == 0 ) {
+            llama_quick_tokenize( message, tokens );
+        }
+/*
+        if( seq_start[tgt_kv] == 0 ) {
+            LLAMA_LOG_INFO("Add BOS(%d)\n", tgt_kv);
             tokens.insert(tokens.begin(), 1);//add BOS for start
+        } */
 
         startpt = seq_start[tgt_kv];
-
-        while (i < tokens.size()) {
+        for( i=0; i < tokens.size(); i += n_batch ) {
             size_t batch_end = std::min(i + n_batch, tokens.size());
             std::vector<int> teabatch(tokens.begin() + i, tokens.begin() + batch_end);
 
@@ -3902,22 +3927,21 @@ struct system_kb {
             seq_start[tgt_kv] += batch.n_tokens;
 
             llama_batch_free(batch);
-            i = batch_end;
         }
-        Kv_mem *mem;
-        for( int j=0; j<3; j++ ) {
-            System_eidet *eid = (System_eidet*)myPool.alloc(sizeof(*eid));
-            new (eid) System_eidet;
-            eid->prepare();
 
-            // read from current_kv and build eidet
-            eid->build(&(kv[tgt_kv]), fromname, message, startpt, tokens.size());
-            // add to source
-            if( iskey ) {
-                mem = kvuser[tgt_kv]->addmem(eid);
-            } else {
-                mem = kvuser[tgt_kv]->addrecent(eid);
-            }
+
+        Kv_mem *mem;
+        System_eidet *eid = (System_eidet*)myPool.alloc(sizeof(*eid));
+        new (eid) System_eidet;
+        eid->prepare();
+
+        // read from current_kv and build eidet
+        eid->build(&(kv[tgt_kv]), fromname, message, startpt, tokens.size());
+        // add to source
+        if( iskey ) {
+            mem = kvuser[tgt_kv]->addmem(eid);
+        } else {
+            mem = kvuser[tgt_kv]->addrecent(eid);
         }
 
         return mem;
@@ -3934,9 +3958,10 @@ struct system_kb {
             new (a) System_actor;
             a->prepare();
             a->name = who;
-            if( who != "System" )
-                a->loadfile();
+            //if( who != "System" )
+            a->loadfile();
             players[who] = a;
+            LLAMA_LOG_INFO("%s: actor prepared\n", __func__);
         } else {
             a = players[who];
         }
@@ -3952,7 +3977,7 @@ struct system_kb {
 
         m->who = who;
         m->what = what;
-        if( when == "" ) {
+        if( when.length() == 0 ) {
             m->when = llama_ts_now();
         } else {
             m->when = llama_string_to_ts(when);
@@ -3975,6 +4000,34 @@ struct system_kb {
     }
 
 };
+
+Kv_mem *new_kv_mem( void )
+{
+    Kv_mem *m = current_kb->getmem();
+    m->m = NULL;
+    m->e = NULL;
+    m->is_full = false;
+    m->first = m->last = 0;
+    return m;
+}
+Kv_mem *new_kv_mem( System_memory *memory )
+{
+    Kv_mem *m = current_kb->getmem();
+    m->m = memory;
+    m->e = NULL;
+    m->is_full = false;
+    m->first = m->last = 0;
+    return m;
+}
+Kv_mem *new_kv_mem( System_eidet *memory )
+{
+    Kv_mem *m = current_kb->getmem();
+    m->e = memory;
+    m->m = NULL;
+    m->is_full = true;
+    m->first = m->last = 0;
+    return m;
+}
 
 void llama_save_actors( void )
 {
@@ -7168,6 +7221,7 @@ static void llama_graph_compute(
 #endif
 
     if (lctx.backend_cpu != nullptr) {
+        //LLAMA_LOG_INFO("%s: using backend_cpu\n", __func__);
         ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
         ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
     }
@@ -7368,7 +7422,7 @@ struct llm_build_context {
         struct ggml_tensor * cur;
         struct ggml_tensor * inpL;
 
-        //LLAMA_LOG_INFO("build_inp_embd\n");
+        LLAMA_LOG_INFO("build_inp_embd\n");
         inpL = llm_build_inp_embd(ctx0, hparams, batch, model.tok_embd, lctx.inp_tokens, lctx.inp_embd, cb);
         cb(inpL, "inp_embd", -1);
 
@@ -7389,7 +7443,7 @@ struct llm_build_context {
             out_embd = ggml_view_1d(ctx0, model.output_embd, 32*4096, 0);
             LLAMA_LOG_INFO("%s: out_embd type = %s, size = %d\n", __func__, ggml_type_name(out_embd->type), ggml_type_size(out_embd->type));
         } else {
-            //LLAMA_LOG_INFO("build_layers\n");
+            LLAMA_LOG_INFO("build_layers tokens:%d, head:%d, keys:%d\n", n_tokens, kv_head, n_keys);
         }
 
         for (int il = 0; il < n_layer; ++il) {
@@ -7439,7 +7493,6 @@ struct llm_build_context {
                 );
                 cb(Kcur, "Kcur", il);
 
-                //LLAMA_LOG_INFO("build_kv tokens:%d, head:%d, keys:%d\n", n_tokens, kv_head, n_keys);
                 cur = llm_build_kv(ctx0, model, hparams, kv_self, gf,
                         model.layers[il].wo, model.layers[il].bo,
                         Kcur, Vcur, Qcur, KQ_mask, inp_pos, n_keys, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
@@ -10123,7 +10176,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     if (batch.token) {
         const int64_t n_tokens = batch.n_tokens;
 
-        //LLAMA_LOG_INFO("%s: prepare %d tokens\n", __func__, n_tokens);
+        LLAMA_LOG_INFO("%s: prepare %d tokens\n", __func__, n_tokens);
         ggml_backend_tensor_set(lctx.inp_tokens, batch.token, 0, n_tokens*ggml_element_size(lctx.inp_tokens));
     }
 
@@ -10131,6 +10184,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         const int64_t n_embd   = hparams.n_embd;
         const int64_t n_tokens = batch.n_tokens;
 
+        LLAMA_LOG_INFO("%s: use embd %d\n", __func__, n_embd);
         ggml_backend_tensor_set(lctx.inp_embd, batch.embd, 0, n_tokens*n_embd*ggml_element_size(lctx.inp_embd));
     }
 
@@ -10341,10 +10395,10 @@ static int llama_decode_internal(
     //LLAMA_LOG_INFO("%s: run compute\n", __func__);
     llama_graph_compute(lctx, gf, n_threads);
 
+    LLAMA_LOG_INFO("%s: compute done\n", __func__);
+
     lctx.seq_end += batch.n_tokens;
 
-
-    //LLAMA_LOG_INFO("%s: compute done\n", __func__);
 
 #ifdef GGML_PERF
     // print timing information per ggml operation (for debugging purposes)
@@ -10369,16 +10423,16 @@ static int llama_decode_internal(
         logits_out.clear();
 #endif
 
+        //LLAMA_LOG_INFO("%s: get backend\n", __func__);
         ggml_backend_t backend_res = ggml_backend_sched_get_node_backend(lctx.sched, res);
         GGML_ASSERT(backend_res != nullptr);
 
-
         if( lctx.record_all > 0 ) {
-            //LLAMA_LOG_INFO("%s: record_logits(0..%d)\n", __func__, n_tokens);
+            LLAMA_LOG_INFO("%s: record_logits(0..%d)\n", __func__, n_tokens);
             logits_out.resize(n_vocab * n_tokens);
             ggml_backend_tensor_get_async(backend_res, res, logits_out.data(), 0, n_vocab*n_tokens*sizeof(float));
         } else {
-            //LLAMA_LOG_INFO("%s: record_logits([%d])\n", __func__, n_tokens);
+            LLAMA_LOG_INFO("%s: record_logits([%d])\n", __func__, n_tokens);
             logits_out.resize(n_vocab);
             ggml_backend_tensor_get_async(backend_res, res, logits_out.data(), (n_vocab*(n_tokens-1))*sizeof(float), n_vocab*sizeof(float));
         }
@@ -10387,6 +10441,7 @@ static int llama_decode_internal(
 //                logits_valid[i] = true;
 #endif
         ggml_backend_synchronize(backend_res);
+        //LLAMA_LOG_INFO("%s: backend synced\n", __func__);
     }
 
     // extract embeddings
@@ -10404,7 +10459,7 @@ static int llama_decode_internal(
                         embd_out.resize(n_embd * 32);
                         ggml_backend_tensor_get_async(backend_embd, out_embds, embd_out.data(), 0, 32*n_embd*sizeof(float));
                     } else if( lctx.record_all == 1 ) {
-                        embd_out.resize(n_embd*(n_tokens-1));
+                        embd_out.resize(n_embd);
                         ggml_backend_tensor_get_async(backend_embd, embd, embd_out.data(), (n_embd*(n_tokens-1))*sizeof(float), n_embd*sizeof(float));
                     } else {
                         embd_out.resize(n_embd);
@@ -10436,6 +10491,7 @@ static int llama_decode_internal(
                 } break;
         }
         ggml_backend_synchronize(backend_embd);
+        //LLAMA_LOG_INFO("%s: backend synced\n", __func__);
     }
 
 
@@ -11507,6 +11563,35 @@ static void tokenizer_st_partition(const llama_vocab & vocab, std::forward_list<
                 }
             }
             it++;
+        }
+    }
+}
+
+void llama_quick_tokenize( std::string raw_text, std::vector<llama_vocab::id> &output )
+{
+    if (raw_text.empty()) {
+        return;
+    }
+    const llama_vocab &vocab = current_model->vocab;
+
+    std::forward_list<fragment_buffer_variant> fragment_buffer;
+    fragment_buffer.emplace_front(raw_text, 0, raw_text.length());
+
+    for (const auto & fragment : fragment_buffer) {
+        if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
+            // without adding this leading whitespace, we do not get the same results as the original tokenizer
+
+            // TODO: It's likely possible to get rid of this string copy entirely
+            //  by modifying llm_tokenizer_x to operate with string offsets like pre-tokenizer
+            //  and passing 'add space prefix' as bool argument
+            //
+            auto raw_text = fragment.raw_text.substr(fragment.offset, fragment.length);
+
+            llm_tokenizer_spm tokenizer(vocab);
+            llama_escape_whitespace(raw_text);
+            tokenizer.tokenize(raw_text, output);
+        } else { // if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_TOKEN)
+            output.push_back(fragment.token);
         }
     }
 }
@@ -14178,10 +14263,9 @@ void llama_pick_actor( std::string actorname )
     current_kb->useactor( actorname );
     current_kb->active_actor = actorname; // decide who is responding with logits
 }
-bool llama_process_tokens( std::string toname, std::string fromname, std::string input, std::vector<int> &tokens )
+int llama_process_tokens( std::string toname, std::string fromname, std::string input, std::vector<int> &tokens )
 {
-    current_kb->process_tokens(toname, fromname, input, tokens);
-    return true;
+    return current_kb->process_tokens(toname, fromname, input, tokens);
 }
 
 struct llama_context *llama_select_context(struct llama_model *model, uint8_t ctx_n)
@@ -14231,7 +14315,7 @@ struct llama_context * llama_new_context_with_model(
         LLAMA_LOG_INFO("%s: error does not compute\n", __func__);
         return NULL;
     } else {
-        ctx->is_clone=true;
+        ctx->is_clone=false;
     }
     if( useparams ) {
         cparams.n_batch          = params.n_batch;
@@ -14393,6 +14477,8 @@ struct llama_context * llama_new_context_with_model(
                     LLAMA_LOG_ERROR("%s: failed to initialize Kompute backend\n", __func__);
                     llama_free(ctx);
                     return nullptr;
+                } else {
+                    LLAMA_LOG_INFO("%s: prepared Kompute layers\n", __func__);
                 }
                 ctx->backends.push_back(backend);
             } else {
@@ -14564,7 +14650,8 @@ struct llama_context * llama_new_context_with_model(
     current_kb->prepare();
     LLAMA_LOG_INFO("Initializing KB.\n");
     memcpy( &current_kb->hparams, &hparams, sizeof(hparams) );
-    current_kb->init(0, 1024);
+    //current_kb->init(0, 1024);
+    current_kb->useactor("System");
     LLAMA_LOG_INFO("current_kb initialized\n");
     return ctx;
 }
@@ -15350,9 +15437,9 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
         myPool.release(target);
     }
 
-    //! process the tokens
+    // process the tokens
     uint8_t tgt = kv->useactor(a->name);
-    Kv_mem *mem = kv->processtokens(tgt, "self", keyval, tokens);
+    Kv_mem *mem = kv->processtokens(tgt, a->name, keyval, tokens);
     if( key == "self" ) {
         a->self = mem->e;
         myPool.release(mem);
@@ -15772,6 +15859,8 @@ int32_t llama_decode(
         LLAMA_LOG_INFO("kv_cache_over: %d + %d > %d\n", batch.n_tokens, ctx->seq_end, ctx->kv_self->size);
         return -1;
     }
+
+    //current_kb->process_tokens()
 
     const int ret = llama_decode_internal(*ctx, batch);
     if (ret < 0) {

@@ -90,19 +90,28 @@ static int llama_sample_top_p_top_k(
     // Populate initial list of all candidates
     std::vector<llama_token_data> candidates;
     candidates.reserve(n_vocab);
+    //std::cerr << "Preparing candidates\n";
     for (int token_id = 0; token_id < n_vocab; token_id++) {
         candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
     }
     llama_token_data_array candidates_p = {candidates.data(), candidates.size(), false};
     // Sample repeat penalty
+    //std::cerr << "running penalties " << last_n_tokens_data << ", " << last_n_tokens_size << ", " << repeat_penalty << "\n";
     llama_sample_repetition_penalties(nullptr, &candidates_p, last_n_tokens_data, last_n_tokens_size, repeat_penalty, 0.0f, 0.0f);
     // Temperature sampling
+    //std::cerr << "running top k\n";
     llama_sample_top_k(ctx, &candidates_p, top_k, 1);
+    //std::cerr << "running tail free\n";
     llama_sample_tail_free(ctx, &candidates_p, 1.0f, 1);
+    //std::cerr << "running typical\n";
     llama_sample_typical(ctx, &candidates_p, 1.0f, 1);
+    //std::cerr << "running top p\n";
     llama_sample_top_p(ctx, &candidates_p, top_p, 1);
+    //std::cerr << "running min p\n";
     llama_sample_min_p(ctx, &candidates_p, min_p, 1);
+    //std::cerr << "running sample temp\n";
     llama_sample_temp(ctx, &candidates_p, temp);
+    //std::cerr << "sampling token\n";
     return llama_sample_token(ctx, &candidates_p);
 }
 
@@ -487,7 +496,7 @@ std::vector<LLModel::Token> LLamaModel::tokenize(PromptContext &ctx, const std::
 {
     const bool wantBOS = ctx.n_past == 0 && ctx.tokens.empty();
     const bool useBOS = wantBOS && shouldAddBOS();
-    auto strCat = wantBOS && !special ? " " + str : str; // insert leading space ourselves, llama.cpp fork doesn't anymore
+    auto strCat = /*wantBOS && !special ? " " + str : */str; // insert leading space ourselves, llama.cpp fork doesn't anymore
     std::vector<LLModel::Token> fres(strCat.size()+4);
     auto fres_len = llama_tokenize(d_ptr->model, strCat.c_str(), strCat.length(), fres.data(), fres.size(), useBOS, special);
     fres.resize(fres_len);
@@ -499,14 +508,14 @@ std::string LLamaModel::tokenToString(Token id) const
     return llama_token_to_piece(d_ptr->ctx, id);
 }
 
-LLModel::Token LLamaModel::sampleToken(PromptContext &promptCtx) const
+LLModel::Token LLamaModel::sampleToken(PromptContext &promptCtx, int n_last_batch) const
 {
-    const size_t n_prev_toks = 1;//std::min((size_t) promptCtx.repeat_last_n, promptCtx.tokens.size());
+    const size_t n_prev_toks = std::min((size_t) promptCtx.repeat_last_n, promptCtx.tokens.size());
     return llama_sample_top_p_top_k(d_ptr->ctx,
         promptCtx.tokens.data() + promptCtx.tokens.size() - n_prev_toks, n_prev_toks,
         promptCtx.top_k, promptCtx.top_p, promptCtx.min_p, promptCtx.temp,
         promptCtx.repeat_penalty,
-        promptCtx.n_last_batch_tokens - 1);
+        n_last_batch - 1);
 }
 
 void LLamaModel::flagTokens(int token0, int token1, int saveflag) const
@@ -537,13 +546,14 @@ void LLamaModel::feedData( std::vector<float> &logits, std::vector<float> &embd 
     embd.resize(sz);
     memcpy( embd.data(), llama_get_embeddings(d_ptr->ctx), sizeof(float)*sz );
 }
-bool LLamaModel::evalTokens(std::string inputStr, std::vector<int32_t> &tokens, std::string fromname, std::string toname) const
+int LLamaModel::evalTokens(std::string inputStr, std::vector<int32_t> &tokens, std::string fromname, std::string toname) const
 {
-    if( inputStr == "" ) { // rebuild coz we don't have it for these tokens.
+    if( inputStr == "" && tokens.size() > 0 ) { // rebuild coz we don't have it for these tokens.
         for( int i=0; i<tokens.size(); i++ ) {
             inputStr += llama_token_to_piece(d_ptr->ctx, tokens[i]);
         }
     }
+    std::cerr << "evalTokens('" << inputStr << "')\n";
     return llama_process_tokens(toname, fromname, inputStr, tokens);
 }
 void LLamaModel::unloadActor(std::string actor)

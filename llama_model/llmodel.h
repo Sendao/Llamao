@@ -106,7 +106,7 @@ public:
     virtual void saveActors( void ) { return; }
     virtual void unloadActor( std::string actorname ) { return; }
     virtual void recordMemory(std::string actor, std::string who, std::string when, std::string what ) { return; }
-    virtual bool evalTokens(std::string inputStr, std::vector<int32_t> &tokens, std::string fromname, std::string toname) const = 0;
+    virtual int evalTokens(std::string inputStr, std::vector<int32_t> &tokens, std::string fromname, std::string toname) const = 0;
     virtual void setKey(std::string keyfor, std::string key, std::string keyval) { return; }
     virtual void printTimings(void) { return; }
     virtual void flagTokens(int token0, int token1, int saveflag) const = 0;
@@ -179,7 +179,7 @@ protected:
     // 'prompt' above calls these functions
     virtual std::vector<Token> tokenize(PromptContext &ctx, const std::string &str, bool special = false) const = 0;
     virtual std::string tokenToString(Token id) const = 0;
-    virtual Token sampleToken(PromptContext &ctx) const = 0;
+    virtual Token sampleToken(PromptContext &ctx, int n_last_batch) const = 0;
     virtual int32_t contextLength() const = 0;
     virtual const std::vector<Token> &endTokens() const = 0;
     virtual bool shouldAddBOS() const = 0;
@@ -206,12 +206,14 @@ protected:
         return true;
     }
 
-    void decodePrompt(std::function<bool(int32_t, int, int, float*, float*)> promptCallback,
+    int decodePrompt(std::function<bool(int32_t, int, int, float*, float*)> promptCallback,
                       std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
                       PromptContext &promptCtx,
-                      std::vector<Token> embd_inp, std::string fromname, std::string toname);
+/*                      std::vector<Token> embd_inp,*/
+                      std::string fromname, std::string toname,
+                      std::string prompt);
     void generateResponse(std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
-                          PromptContext &promptCtx, std::string fromname, std::string toname);
+                          PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch);
 
 private:
     friend class LLMImplementation;

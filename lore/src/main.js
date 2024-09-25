@@ -1159,7 +1159,7 @@ async function runQuery(a,b,c)
 
             await windowMessage(b, "setBudget", budget, autonomy);
 
-            await sendToWindow(b, "System", "Ready.");
+            await sendToWindow(b, "System", "Starting up...");
             await sendToWindow(b, "System", 0);
             return;
         }
@@ -1325,8 +1325,8 @@ async function runQuery(a,b,c)
         return;
     }
 
-    await sendToWindow(b, username, c);
-    await sendToWindow(b, username, 0);
+    //await sendToWindow(b, username, c);
+    //await sendToWindow(b, username, 0);
     var pos=-1;
     let found=false;
 
@@ -1421,8 +1421,8 @@ async function acquireDesktop()
 {
     const { screen } = require('electron');
 
-    //let tray = new Tray(nativeImage.createFromPath(pathapp.resolve(os.homedir(), "Desktop/pics/eye2.png")));
-    let tray = new Tray();
+    let tray = new Tray(nativeImage.createFromPath(pathapp.resolve(os.homedir(), "Desktop/pics/eye2.png")));
+    //let tray = new Tray();
     tray.setContextMenu(Menu.buildFromTemplate([
         { label: 'Show', click: function() { newControl(); } },
         { label: 'Quit', click: function() { endgame(); } } ] ));

@@ -875,7 +875,7 @@ static bool llama_kv_cache_init(
 extern struct llama_model *current_model;
 extern struct llama_context *current_context;
 
-LLAMA_API bool llama_process_tokens( std::string toname, std::string fromname, std::string input, std::vector<llama_token> &tokens );
+LLAMA_API int llama_process_tokens( std::string toname, std::string fromname, std::string input, std::vector<llama_token> &tokens );
 LLAMA_API std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token);
 
 // Internal API to be implemented by llama.cpp and used by tests/benchmarks only

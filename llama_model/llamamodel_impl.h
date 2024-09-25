@@ -54,7 +54,7 @@ public:
     void setKey( std::string keyfor, std::string key, std::string keyval ) override;
     void printTimings( void ) override;
     void unloadActor( std::string actor ) override;
-    bool evalTokens(std::string inputStr, std::vector<int32_t> &tokens, std::string fromname, std::string toname ) const override;
+    int evalTokens(std::string inputStr, std::vector<int32_t> &tokens, std::string fromname, std::string toname ) const override;
     void recordMemory(std::string actor, std::string who, std::string when, std::string what ) override;
     void saveActors(void) override;
     void flagTokens(int token0, int token1, int saveflag) const override;
@@ -72,7 +72,7 @@ private:
 protected:
     std::vector<Token> tokenize(PromptContext &ctx, const std::string &str, bool special) const override;
     std::string tokenToString(Token id) const override;
-    Token sampleToken(PromptContext &ctx) const override;
+    Token sampleToken(PromptContext &ctx, int n_last_batch) const override;
     int32_t contextLength() const override;
     const std::vector<Token> &endTokens() const override;
     bool shouldAddBOS() const override;

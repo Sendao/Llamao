@@ -952,6 +952,7 @@ How do people interact with each other?
             }
         }
         */
+        console.log("broadcastQuery()");
         this.actors[0].modelstate.inform(from, msg);
         return;
     }
