@@ -145,6 +145,10 @@ public:
 
     virtual void setThreadCount(int32_t n_threads) { (void)n_threads; }
     virtual int32_t threadCount() const { return 1; }
+    virtual void markRewind(void) { return; }
+    virtual void rewindToMark(void) { return; }
+    virtual void queryActorNames(std::vector<std::string> &) { return; }
+    virtual int pollVocab( std::unordered_map< std::string, int > &searchspace, float *logits ) { return -1; }
 
     const Implementation &implementation() const {
         return *m_implementation;
@@ -206,15 +210,23 @@ protected:
         return true;
     }
 
+    int selectAnswer( std::string actor, std::string query, PromptContext &parentCtx,
+                              std::unordered_map<std::string, int> &answers, std::string framing );
+    std::string queryActor( std::string actor, std::string query, PromptContext &parentCtx );
     int decodePrompt(std::function<bool(int32_t, int, int, float*, float*)> promptCallback,
                       std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
                       PromptContext &promptCtx,
 /*                      std::vector<Token> embd_inp,*/
                       std::string fromname, std::string toname,
                       std::string prompt);
+    int decodePrompt2(std::string fromname,
+                               std::string toname,
+                               std::string prompt);
     void generateResponse(std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
                           PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch);
-
+    std::string generateResponse2(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch);
+    int generateResponse3(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch,
+                                   std::unordered_map< std::string, int > &answers);
 private:
     friend class LLMImplementation;
 };

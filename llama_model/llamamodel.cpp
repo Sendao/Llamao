@@ -404,6 +404,22 @@ void LLamaModel::setThreadCount(int32_t n_threads) {
     d_ptr->n_threads = n_threads;
     llama_set_n_threads(d_ptr->ctx, n_threads, n_threads);
 }
+void LLamaModel::markRewind(void)
+{
+    llama_mark_rewind(d_ptr->ctx);
+}
+void LLamaModel::rewindToMark(void)
+{
+    llama_rewind_to_mark(d_ptr->ctx);
+}
+void LLamaModel::queryActorNames(std::vector<std::string> &names)
+{
+    llama_query_actor_names(names);
+}
+int LLamaModel::pollVocab( std::unordered_map< std::string, int > &searchspace, float *logits )
+{
+    return llama_poll_vocab(searchspace, logits);
+}
 
 int32_t LLamaModel::threadCount() const {
     return d_ptr->n_threads;

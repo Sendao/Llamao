@@ -858,6 +858,7 @@ extern "C" {
 #endif
 
 #include <vector>
+#include <unordered_map>
 
 LLAMA_API void llama_pick_actor( std::string actorname );
 uint16_t llama_tokenstr(
@@ -875,8 +876,12 @@ static bool llama_kv_cache_init(
 extern struct llama_model *current_model;
 extern struct llama_context *current_context;
 
+LLAMA_API void llama_mark_rewind( struct llama_context * );
+LLAMA_API void llama_rewind_to_mark( struct llama_context * );
+LLAMA_API void llama_query_actor_names( std::vector<std::string> & );
 LLAMA_API int llama_process_tokens( std::string toname, std::string fromname, std::string input, std::vector<llama_token> &tokens );
 LLAMA_API std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token);
+LLAMA_API int llama_poll_vocab( std::unordered_map< std::string, int > &searchspace, float *logits );
 
 // Internal API to be implemented by llama.cpp and used by tests/benchmarks only
 #ifdef LLAMA_API_INTERNAL

@@ -4,6 +4,73 @@
 #include <iostream>
 #include <string>
 
+/*
+ * - we will do this but first we need to refine the token sampler to return probabilities properly
+ *
+int LLModel::pollAnswer( std::string query, PromptContext &parentCtx, std::vector<std::string> &answers )
+{
+    std::vector<std::string> actorNames;
+    queryActorNames(actorNames);
+    std::vector<std::string>::iterator it;
+    std::string actorName;
+    std::vector<int> results;
+
+    for( it = actorNames.begin(); it != actorNames.end(); it++ ) {
+        actorName = *it;
+
+    }
+}
+*/
+
+int LLModel::selectAnswer( std::string actor, std::string query, PromptContext &parentCtx,
+                          std::unordered_map<std::string, int> &answers, std::string framing )
+{
+    std::string formed = "<|im_start|>System\n" + query + "<|im_end|><|im_start|>" + actor + "\n" + framing;
+    PromptContext pctx;
+    pctx.n_batch = 64;
+    pctx.n_last_batch_tokens = 0;
+    pctx.min_p = parentCtx.min_p;
+    pctx.repeat_last_n = 64;
+    pctx.top_k = parentCtx.top_k;
+    pctx.top_p = parentCtx.top_p;
+    pctx.temp = parentCtx.temp;
+    pctx.repeat_penalty = parentCtx.repeat_penalty;
+    pctx.contextErase = parentCtx.contextErase;
+
+    markRewind();
+    int n_last_batch = decodePrompt2("System", actor, formed);
+    std::cerr << "selectAnswer decode complete\n";
+    int ires = generateResponse3(pctx, "System", actor, n_last_batch, answers);
+    std::cerr << "selectAnswer generate complete\n";
+    rewindToMark();
+
+    return ires;
+}
+
+std::string LLModel::queryActor( std::string actor, std::string query, PromptContext &parentCtx )
+{
+    std::string formed = "<|im_start|>System\n" + query + "<|im_end|><|im_start|>" + actor + "\n";
+    PromptContext pctx;
+    pctx.n_batch = 64;
+    pctx.n_last_batch_tokens = 0;
+    pctx.min_p = parentCtx.min_p;
+    pctx.repeat_last_n = 64;
+    pctx.top_k = parentCtx.top_k;
+    pctx.top_p = parentCtx.top_p;
+    pctx.temp = parentCtx.temp;
+    pctx.repeat_penalty = parentCtx.repeat_penalty;
+    pctx.contextErase = parentCtx.contextErase;
+
+    markRewind();
+    int n_last_batch = decodePrompt2("System", actor, formed);
+    std::cerr << "queryActor decode complete\n";
+    std::string res = generateResponse2(pctx, "System", actor, n_last_batch);
+    std::cerr << "queryActor generate complete: " + res + "\n";
+    rewindToMark();
+
+    return res;
+}
+
 void LLModel::prompt(const std::string &oldprompt,
                      const std::string &promptTemplate,
                      std::function<bool(int32_t, int, int, float *, float *)> promptCallback,
@@ -160,13 +227,47 @@ void LLModel::prompt(const std::string &oldprompt,
 
     std::cerr << "decodePrompt complete\n";
 
-    // decode the assistant's reply, either generated or spoofed
-    if (fakeReply == nullptr) {
-        generateResponse(responseCallback, promptCtx, fromname, toname, n_last_batch);
-    } else {
-        //embd_inp = tokenize(promptCtx, *fakeReply, false);
-        decodePrompt(promptCallback, responseCallback, promptCtx, fromname, toname, *fakeReply);
+    std::vector<std::string> actorNames;
+    queryActorNames(actorNames);
+    actorNames.push_back(fromname);
+
+    std::string query = "Who should reply?";
+    std::string framing = "It should be ";
+    std::vector<std::string>::iterator it;
+    bool started=false;
+    std::unordered_map<std::string, int> pollData;
+
+    int i=0;
+    for( it = actorNames.begin(); it != actorNames.end(); it++ ) {
+        if( started ) query.append("/");
+        started=true;
+        query.append(*it);
+        pollData[*it] = i;
+        if( *it == toname ) {
+            pollData["I"] = i;
+            pollData["Me"] = i;
+        }
+        i++;
     }
+    query.append(")");
+
+    int iName;
+    while( true ) {
+        iName = selectAnswer(toname, query, promptCtx, pollData, framing);
+        toname = actorNames[iName];
+        std::cerr << "pick actor " << toname << "\n";
+        if( toname == fromname ) {
+            std::cerr << "now it's the user's turn.\n";
+            break;
+        } else {
+            std::string msgbuf = "<|im_start|>" + toname + "\n";
+            decodePrompt(promptCallback, responseCallback, promptCtx, toname, "all", msgbuf);
+        }
+        markRewind();
+        generateResponse(responseCallback, promptCtx, fromname, toname, n_last_batch);
+        rewindToMark();
+        decodePrompt(promptCallback, responseCallback, promptCtx, toname, "all", prompt);
+    };
 }
 
 /*
@@ -293,6 +394,13 @@ int LLModel::decodePrompt(std::function<bool(int32_t, int, int, float*, float*)>
     std::vector<int> tokens;
     return evalTokens(prompt, tokens, fromname, toname);
 }
+int LLModel::decodePrompt2(std::string fromname,
+                          std::string toname,
+                          std::string prompt) {
+    std::vector<int> tokens;
+    return evalTokens(prompt, tokens, fromname, toname);
+}
+
 
 void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
                                PromptContext &promptCtx, std::string fromname, std::string toname,
@@ -337,11 +445,9 @@ void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, i
     for (i = 0; i < n_gen; i++) {
         //std::cerr << "tokens.size() = " << promptCtx.tokens.size() << "\n";
         feedData( promptCtx.logits, promptCtx.embds );
-        std::cerr << "sampleToken n_last_batch=" << n_last_batch << "\n";
         auto id = sampleToken(promptCtx, n_last_batch);
         newTokens.clear();
         newTokens.push_back(id);
-        std::cerr << "tokenToString(" << id << ")\n";
         const std::string str = tokenToString(id);
         std::cerr << "gen: " << str << "(" << id << ")\n";
         if( (n_last_batch=evalTokens(str, newTokens, activename, toname)) == 0 ) {
@@ -354,96 +460,6 @@ void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, i
         auto mlogits = promptCtx.logits;
         auto membd = promptCtx.embds;
 
-        if( gen_new && sendToAll ) {
-            int ipos;
-            ipos = buf.find(" ");
-            if( ipos == std::string::npos ) {
-                ipos = buf.find("\n");
-            }
-            if( ipos == std::string::npos ) {
-                ipos = buf.find("\t");
-            }
-            if( ipos == std::string::npos ) {
-                ipos = buf.find(":");
-            }
-            if( ipos != std::string::npos ) {
-                // name completed.
-                // switch actor.
-                buf = buf.substr(0, ipos);
-                std::cerr << "Found actor " << buf << "\n";
-                if( buf == fromname ) {
-                    // end here so we don't send the tokens back.
-                    break;
-                }
-                activename = buf;
-                pickActor(buf);
-                gen_new=false;
-            }
-            tokenbuf.push_back(id);
-            strbuf.push_back(std::string(str));
-            embdbuf.push_back(membd);
-            logitbuf.push_back(mlogits);
-            continue;
-        }
-
-        if( sendToAll && new_literal.starts_with(buf) ) {
-            std::cerr << "found new_literal\n";
-            if( buf.starts_with(new_literal) ) {
-                std::cerr << "new_literal found buf\n";
-
-                // generate new messenger
-                pickActor("System");
-                activename = "System";
-                finished_gen=false;
-                gen_new=true;
-                if( buf.length() > new_literal.length() ) {
-                    buf = buf.substr(new_literal.length());
-                } else {
-                    buf = "";
-                }
-
-                tokenbuf.push_back(id);
-                strbuf.push_back(std::string(str));
-                embdbuf.push_back(membd);
-                logitbuf.push_back(mlogits);
-                continue;
-            }
-            finished_gen=true;
-        }
-        if( finished_gen && !ending ) { // we are between generations trying to figure out who speaks next
-            tokenbuf.push_back(id);
-            strbuf.push_back(std::string(str));
-            embdbuf.push_back(membd);
-            logitbuf.push_back(mlogits);
-            continue;
-        }
-
-        if( tokenbuf.size() > 0 ) {
-            sit = strbuf.begin();
-            lit = logitbuf.begin();
-            eit = embdbuf.begin();
-
-            for( it = tokenbuf.begin(); it != tokenbuf.end(); it++ ) {
-                id = *it;
-                sstr = *sit;
-                mlogits = *lit;
-                membd = *eit;
-                if(!responseCallback(id, sstr, mlogits.size(), membd.size(), mlogits.data(), membd.data())) {
-                    promptCtx.n_predict = 0;
-                    i = 0;
-                    std::cerr << "Generation aborted by responseCallback.\n";
-                    ending=true;
-                    break;
-                }
-            }
-            tokenbuf.clear();
-            logitbuf.clear();
-            embdbuf.clear();
-
-            if( ending ) break;
-            continue;
-        }
-
         // share with cb
         if (!responseCallback(id, std::string(str), mlogits.size(), membd.size(), mlogits.data(), membd.data())) {
             promptCtx.n_predict = 0;
@@ -453,24 +469,166 @@ void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, i
         }
 
         if( generatedTokens > 0 && buf.ends_with(end_literal) ) {
-            pickActor("System");
-            activename="System";
-            //promptCtx.n_predict = 0;
-            i = 0;
-            if( !sendToAll ) { // normal termination
-                break;
-            } // if sending to all, we let them deliberate by choosing a new speaker.
-            // the new speaker may be the user by the way!
-            finished_gen = true;
-            buf = "";
-            generatedTokens++;
-            continue;
+            break;
+        }
+        if( !end_literal.starts_with(buf) ) {
+            const char *p1, *p2;
+            int chars=0;
+            bool found=false;
+            for( p1 = end_literal.c_str(), p2 = buf.c_str(); *p1 && *p2; p2++ ) {
+                if( *p2 == *p1 ) {
+                    found=true;
+                    p1++;
+                    chars++;
+                } else if( found ) {
+                    found=false;
+                    chars=0;
+                    p1 = end_literal.c_str();
+                }
+            }
+            if( !found ) {
+                generatedTokens++;
+                buf="";
+            } else {
+                char buf1[24], *p3;
+                for( p3=buf1, p2 = end_literal.c_str(); *p2 && chars>0; p2++, p3++, chars-- ) {
+                    *p3 = *p2;
+                }
+                *p3 = '\0';
+                buf = buf1;
+                std::cerr << "Reduce buffer to '" << buf1 << "'\n";
+            }
+        }
+    }
+}
+std::string LLModel::generateResponse2(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch) {
+    std::string cachedResponse;
+    std::string end_literal = "<|im_end|>";
+    int i;
+    std::string buf = "";
+    std::string res;
+    std::vector<int>::iterator it;
+
+    int generatedTokens=0;
+    std::vector<int> newTokens;
+
+    std::cerr << "genResponse2()\n";
+    while( true ) {
+        feedData( promptCtx.logits, promptCtx.embds );
+        std::cerr << "sampleToken n_last_batch=" << n_last_batch << "\n";
+        auto id = sampleToken(promptCtx, n_last_batch);
+        newTokens.clear();
+        newTokens.push_back(id);
+
+        const std::string str = tokenToString(id);
+        std::cerr << "gen: " << str << "(" << id << ")\n";
+        if( (n_last_batch=evalTokens(str, newTokens, toname, fromname)) == 0 ) {
+            std::cerr << implementation().modelType() << " ERROR: Failed to predict next token\n";
+            id = 32000; // end
+            buf += "<|im_end|>";
+        } else {
+            buf += std::string(str);
+        }
+        promptCtx.tokens.emplace_back( id );
+
+        if( buf.find(end_literal) != std::string::npos ) {
+            break;
         }
         if( !end_literal.starts_with(buf) ) {
             generatedTokens++;
-            buf="";
+            res += buf;
+            buf = "";
         }
     }
+
+    return res;
+}
+int LLModel::generateResponse3(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch,
+                                std::unordered_map< std::string, int > &answers)
+{
+    std::string cachedResponse;
+    std::string end_literal = "<|im_end|>";
+    int i;
+
+    std::string buf = "", answerBuf;
+    std::vector<std::string>::iterator sit;
+    std::vector<int> newTokens;
+    std::unordered_map<int, int> possible;
+
+    int invalid_tokens=0, max_invalid=32;
+
+    int selected_answer=0;
+
+    std::cerr << "genResponse3()\n";
+    while( true ) {
+        feedData( promptCtx.logits, promptCtx.embds );
+        std::cerr << "sampleToken n_last_batch=" << n_last_batch << "\n";
+        /*
+        auto id = sampleToken(promptCtx, n_last_batch);
+        newTokens.clear();
+        newTokens.push_back(id);
+        std::cerr << "tokenToString(" << id << ")\n";
+        const std::string str = tokenToString(id);
+        std::cerr << "gen: " << str << "(" << id << ")\n";
+        if( (n_last_batch=evalTokens(str, newTokens, fromname, toname)) == 0 ) {
+            std::cerr << implementation().modelType() << " ERROR: Failed to predict next token\n";
+            id = 32000; // end
+        }
+        promptCtx.tokens.emplace_back( id );
+        buf += std::string(str);
+        possible.clear();
+
+        int newresult, resultSize=0;
+        bool found;
+
+        for( const auto &pair : answers ) {
+            answerBuf = pair.second;
+            if( answerBuf.starts_with(buf) ) {
+                found=false;
+                for( const auto &pair2 : possible ) {
+                    if( pair2.first == pair.first ) {
+                        newresult = pair2.second+1;
+                        found=true;
+                        break;
+                    }
+                }
+                if( !found ) {
+                    possible[pair.first] = 1;
+                } else {
+                    possible[pair.first] = newresult;
+                }
+            }
+        }
+        if( possible.size() == 1 ) {
+            for( const auto &pair : possible ) {
+                selected_answer = pair.first;
+                break;
+            }
+            break;
+        }
+        if( possible.size() == 0 ) {
+            invalid_tokens++;
+            if( invalid_tokens >= max_invalid ) {
+                std::cerr << "Invalid answers. Defaulting to answer 0.\n";
+                break;
+            }
+            std::cerr << "Invalid answer [" << buf << "].\n";
+            buf = "";
+        }
+        */
+        selected_answer = pollVocab( answers, promptCtx.logits.data() );
+        std::cerr << "Got answer: " << selected_answer << "\n";
+
+        return selected_answer;
+
+        //if( buf.ends_with(end_literal) ) {
+        //    break;
+        //}
+    }
+    /*
+    std::cerr << "Got answer: " << selected_answer << ": " << answers[selected_answer] << "\n";
+    return selected_answer;
+    */
 }
 
 void LLModel::embed(

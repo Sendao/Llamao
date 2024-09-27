@@ -3439,6 +3439,34 @@ struct system_kb {
     System_actor *kvuser[3] = {NULL,NULL,NULL};
     bool kv_ready[3] = {false,false,false};
     uint8_t current_kv;
+    int16_t seq_mark[3] = {-1,-1,-1};
+
+    void mark_rewind(void)
+    {
+        for( int i=0; i<3; i++ ) {
+            seq_mark[i] = seq_start[i];
+        }
+    }
+    void rewind_to_mark(void)
+    {
+        for( int i=0; i<3; i++ ) {
+            seq_start[i] = seq_mark[i];
+            seq_mark[i] = -1;
+        }
+    }
+    void query_actor_names(std::vector<std::string> &names)
+    {
+        std::vector<System_actor *>::iterator it;
+        System_actor *a;
+        names.clear();
+
+        for( it = actors.begin(); it != actors.end(); it++ ) {
+            a = *it;
+            names.push_back(a->name); // does not include "System" name
+        }
+
+        return;
+    }
 
     Kv_mem *getmem(void)
     {
@@ -3863,18 +3891,23 @@ struct system_kb {
 
         for( int tgt=0; tgt<3; tgt++ ) {
             if( kv_ready[tgt] ) {
+                if( kvuser[tgt]->name == fromname ) {
+                    messaged.insert( kvuser[tgt] );
+                    continue;
+                }
+
                 if( kvuser[tgt]->name == active_actor ) {
                     active_kv = tgt;
                 }
                 processtokens(tgt, fromname, message, tokens); // fully process
-                if( tgt != 0 )
-                    messaged.insert( kvuser[tgt] );
+                messaged.insert( kvuser[tgt] );
             }
         }
 
         // make sure the context has the active actor as the current kv cache
         usekv(active_kv);
 
+        if( seq_mark[active_kv] != -1 ) return NULL; // Don't generate memories if we're going to rewind.
 
         std::vector<System_actor*>::iterator it; // just say that we're sending it since they're not active yet
         System_memory *m = (System_memory*)myPool.alloc(sizeof(*m));
@@ -3886,6 +3919,7 @@ struct system_kb {
             if( messaged.contains( *it ) ) continue;
 
             a = *it;
+            if( a->name == fromname ) continue;
             a->addhist(m);
         }
         return n_last_batch;
@@ -3929,6 +3963,7 @@ struct system_kb {
             llama_batch_free(batch);
         }
 
+        if( seq_mark[tgt_kv] != -1 ) return NULL; // Don't generate memories if we're going to rewind.
 
         Kv_mem *mem;
         System_eidet *eid = (System_eidet*)myPool.alloc(sizeof(*eid));
@@ -4000,6 +4035,63 @@ struct system_kb {
     }
 
 };
+
+int llama_poll_vocab( std::unordered_map< std::string, int > &searchspace, float *logits )
+{
+    int i, j;
+    llama_vocab *vocab = &(current_model->vocab);
+    std::unordered_map< int, float > scores;
+    std::unordered_map< int, std::string > revMap;
+
+    for( const auto &pair : searchspace ) {
+        if( revMap.find(pair.second) != revMap.end() ) {
+            continue;
+        }
+        revMap[ pair.second ] = pair.first;
+    }
+
+    for( i=0; i<32003; i++ ) {
+        std::string *link = &(vocab->id_to_token[i].text);
+        if( logits[i] <= 0.5 ) continue;
+
+        for( const auto &pair : searchspace ) {
+            bool found=true;
+            for( j=0; j<link->length(); j++ ) {
+                if( (*link)[j] != pair.first[j] ) {
+                    found=false;
+                    break;
+                }
+            }
+            if( found )
+                scores[pair.second] += logits[i];
+        }
+
+    }
+    int choice=-1;
+    float highestScore=0;
+    for( const auto &pair : scores ) {
+        LLAMA_LOG_INFO("%s: score for [%s]: [%f]\n", __func__, revMap[pair.first].c_str(), pair.second);
+        if( pair.second > highestScore ) {
+            highestScore = pair.second;
+            choice = pair.first;
+        }
+    }
+
+    return choice;
+}
+
+void llama_mark_rewind( struct llama_context *ctx )
+{
+    current_kb->mark_rewind();
+}
+void llama_rewind_to_mark( struct llama_context *ctx )
+{
+    current_kb->rewind_to_mark();
+}
+void llama_query_actor_names(std::vector<std::string> &names)
+{
+    current_kb->query_actor_names(names);
+}
 
 Kv_mem *new_kv_mem( void )
 {
@@ -7422,7 +7514,7 @@ struct llm_build_context {
         struct ggml_tensor * cur;
         struct ggml_tensor * inpL;
 
-        LLAMA_LOG_INFO("build_inp_embd\n");
+        //LLAMA_LOG_INFO("build_inp_embd\n");
         inpL = llm_build_inp_embd(ctx0, hparams, batch, model.tok_embd, lctx.inp_tokens, lctx.inp_embd, cb);
         cb(inpL, "inp_embd", -1);
 
@@ -10395,7 +10487,7 @@ static int llama_decode_internal(
     //LLAMA_LOG_INFO("%s: run compute\n", __func__);
     llama_graph_compute(lctx, gf, n_threads);
 
-    LLAMA_LOG_INFO("%s: compute done\n", __func__);
+    //LLAMA_LOG_INFO("%s: compute done\n", __func__);
 
     lctx.seq_end += batch.n_tokens;
 

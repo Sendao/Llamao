@@ -33,6 +33,9 @@ public:
     void pickActor( std::string actorname ) override;
     //void stampMemory() override; // uses pickActor's id
     void setThreadCount(int32_t n_threads) override;
+    void markRewind(void) override;
+    void rewindToMark(void) override;
+    void queryActorNames(std::vector<std::string> &) override;
     int32_t threadCount() const override;
     std::vector<GPUDevice> availableGPUDevices(size_t memoryRequired) const override;
     bool initializeGPUDevice(size_t memoryRequired, const std::string &name) const override;
@@ -40,6 +43,7 @@ public:
     bool hasGPUDevice() override;
     bool usingGPUDevice() override;
     int reserveCache( PromptContext &ctx, int tokens ) override;
+    int pollVocab( std::unordered_map< std::string, int > &searchspace, float *logits ) override;
 
     size_t embeddingSize() const override;
     // user-specified prefix
