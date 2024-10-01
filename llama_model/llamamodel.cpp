@@ -406,11 +406,19 @@ void LLamaModel::setThreadCount(int32_t n_threads) {
 }
 void LLamaModel::markRewind(void)
 {
-    llama_mark_rewind(d_ptr->ctx);
+    llama_mark_rewind();
 }
 void LLamaModel::rewindToMark(void)
 {
-    llama_rewind_to_mark(d_ptr->ctx);
+    llama_rewind_to_mark();
+}
+void LLamaModel::markGeneration(std::string mark)
+{
+    llama_mark_generation(mark);
+}
+void LLamaModel::rewindGeneration(std::string what, std::vector<int> &tokens)
+{
+    llama_rewind_generation(what, tokens);
 }
 void LLamaModel::queryActorNames(std::vector<std::string> &names)
 {
@@ -564,12 +572,7 @@ void LLamaModel::feedData( std::vector<float> &logits, std::vector<float> &embd 
 }
 int LLamaModel::evalTokens(std::string inputStr, std::vector<int32_t> &tokens, std::string fromname, std::string toname) const
 {
-    if( inputStr == "" && tokens.size() > 0 ) { // rebuild coz we don't have it for these tokens.
-        for( int i=0; i<tokens.size(); i++ ) {
-            inputStr += llama_token_to_piece(d_ptr->ctx, tokens[i]);
-        }
-    }
-    std::cerr << "evalTokens('" << inputStr << "')\n";
+    std::cerr << "evalTokens(" << fromname << " => " << toname << ": " << tokens.size() << "+'" << inputStr << "')\n";
     return llama_process_tokens(toname, fromname, inputStr, tokens);
 }
 void LLamaModel::unloadActor(std::string actor)

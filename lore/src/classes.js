@@ -952,8 +952,7 @@ How do people interact with each other?
             }
         }
         */
-        console.log("broadcastQuery()");
-        this.actors[0].modelstate.inform(from, msg);
+        this.actors[0].modelstate.query(this.actors[0], from, msg);
         return;
     }
 
@@ -1117,7 +1116,6 @@ class ArtChar
         this.modified_keys = [];
         this.cut_keys = [];
         this.temperature = 1.5;
-        this.archivedstates = [];
         this.lastSummary = "";
         this.prompttokens = 0;
         this.filter = "";
@@ -1431,8 +1429,7 @@ class ArtChar
         }.bind(this) );
         */
 
-        this.archivedstates = [];
-        /* no more archived states.
+        /* no more archived save files.
         if( !fs.existsSync( sd + "/" ) ) {
             fs.mkdirSync(sd + "/");
         }
@@ -1528,141 +1525,6 @@ class ArtChar
         this.loading = false;
     }
 
-    /*
-    async saveState(fn)
-    {
-        var st;
-
-        await this.shi.msgWindow(this.shi.winid, "System", "Saving state for " + this.charname + "...");
-
-        st = await this.modelstate.model.saveState();
-        let endfn = this.archivedstates.length + "_" + fn;
-        let tgtfn = "./char/" + this.charname + "/" + endfn + ".dat";
-        let reffn = "./char/" + this.charname + "_n/" + endfn + ".ref";
-        if( !await fs.existsSync("./char/" + this.charname + "/") ) {
-            await fs.mkdirSync("./char/" + this.charname + "/");
-        }
-        if( !await fs.existsSync("./char/" + this.charname + "_n/") ) {
-            await fs.mkdirSync("./char/" + this.charname + "_n/");
-        }
-
-        await fs.writeFileSync(tgtfn, st, 'binary', {flush:true});
-        let refobj = { nPast: this.modelstate.nPast, systemPast: this.systemPast, lastToken: this.lastToken, location: this.location, systemPrompt: this.systemprompt,
-            memoryN: this.memoryN, memoryEnd: this.memoryEnd, historyN: this.historyN, chatN: this.chatN, scratchN: this.scratchN
-             };
-        if( this.memories.length > 0 ) {
-            refobj.mem = this.memories;
-        } else {
-            refobj.mem = [];
-        }
-        refobj.handles = this.modelstate.savedinfo;
-        refobj.scratch = this.scratchpad.slice();
-        if( this.history.length > 0 ) {
-            var ep = this.history.length-25;
-            if( ep < 0 ) ep = 0;
-            var histrec=[];
-            for( var i=ep; i<this.history.length; i++ ){ 
-                var hi = this.history[i];
-                histrec.push( { prompt: hi.prompt, response: hi.response, from: hi.from } );
-            }
-            refobj.history = histrec;
-        } else refobj.history = [];
-        await fs.writeFileSync(reffn, JSON.stringify(refobj), 'utf8', {flush:true});
-
-        await this.shi.msgWindow(this.shi.winid, "System", "state saved.\n");
-        await this.shi.msgWindow(this.shi.winid, "System", 0);
-        this.archivedstates.unshift({'fn': endfn, 'mtime': 0});
-        return true;
-    }
-
-    async loadState(n=0)
-    {
-        if( this.archivedstates.length <= n ) {
-            console.log("No state info to load.");
-            await this.modelstate.align(this);
-            this.started=true;
-            await this.resetPrompt(true, 2, false);
-            return;
-        }
-        let st = this.archivedstates[n];
-
-        console.log("Loading state: ", st);
-        let mfn = st.fn.replaceAll(".dat", ".ref");
-        if( !await fs.existsSync("./char/" + this.charname + "_n/") ) {
-            await fs.mkdirSync("./char/" + this.charname + "_n/");
-        }
-        let refobj = await fs.readFileSync("./char/" + this.charname + "_n/" + mfn, 'utf8');
-        var ref;
-        if( refobj[0] == "{" ) {
-            refobj = JSON.parse(refobj);
-            ref = refobj.nPast;
-            this.lastToken = refobj.lastToken;
-            this.systemPast = refobj.systemPast;
-            this.history = refobj.history;
-            var j=this.history.length-4;
-            if( j < 0 ) j = 0;
-            for( ; j < this.history.length; j++ ) {
-                this.shi.adjustMood(this.charname, this.history[j].prompt + "\n" + this.history[j].response);
-            }
-            if( 'systemPrompt' in refobj ) {
-                this.systemprompt = refobj.systemPrompt;
-            }
-            this.location = refobj.location;
-            if( this.lochist.indexOf(this.location) < 0 ) {
-                this.lochist.push(this.location);
-                this.lochistnew.push(this.location);
-            }
-
-            if( 'handles' in refobj ) {
-                this.modelstate.savedinfo = refobj.handles;
-            }
-
-            this.memoryN = refobj.memoryN;
-            this.memoryEnd = refobj.memoryEnd;
-            this.lastMemory = refobj.mem.length;
-            this.scratchN = refobj.scratchN;
-            this.historyN = refobj.historyN;
-            this.chatN = refobj.chatN;
-            this.scratchpad = refobj.scratch;
-            if( typeof this.scratchpad == 'undefined' ) this.scratchpad = [];
-
-            this.memories = refobj.mem;
-
-        } else {
-            ref = parseInt(refobj);
-            this.lastToken = ref;
-            this.systemPast = 0;
-            this.history = [];
-            this.location = "";
-            this.memoryN = -1;
-            this.memoryEnd = -1;
-            this.lastMemory = 0;
-            this.scratchN = -1;
-            this.historyN = -1;
-            this.scratchpad = [];
-            this.chatN = 1000;
-            this.memories = [];
-            this.modelstate.savedinfo = {};
-        }
-        if( !await fs.existsSync("./char/" + this.charname + "/") ) {
-            await fs.mkdirSync("./char/" + this.charname + "/");
-        }
-        console.log("Restoring state.");
-        let res = await this.modelstate.model.restoreState( await fs.readFileSync("./char/" + this.charname + "/" + st.fn, 'binary') );
-        console.log("Checking status...");
-
-        this.started = false;
-        await this.modelstate.align(this);
-        //if( parseInt(ref) <= 3000 ) {
-            this.modelstate.nPast = parseInt(ref);
-        //    console.log("Load state info: (" + this.modelstate.nPast + "):", res);
-        / *} else {
-            console.log("State info is too large(" + parseInt(ref) + "): resetting to end of prompt.");
-            //this.modelstate.nPast = 3000;
-            await this.resetPrompt(true, 2, true);
-        }* /
-    }
-    */
 
     splitSentences(str)
     {
@@ -2697,7 +2559,7 @@ class ModelState
         if( !('nPredict' in opts) )           opts.nPredict=typeof this.nGen == 'undefined' || !this.continuing ? 256 : this.nGen;
         if( !('continuing' in opts) )          opts.continuing=this.continuing;
 
-        console.log("Prepare opts: set tokencb=", tokencb);
+        //console.log("Prepare opts: set tokencb=", tokencb);
         opts.onResponseToken=async function(tokencb, tokenId, token, logits, embds) {
             //console.log("ORT()", tokencb, token);
             if( tokencb != null && typeof tokencb != 'undefined' ) {

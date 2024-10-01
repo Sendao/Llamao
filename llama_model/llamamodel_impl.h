@@ -35,6 +35,8 @@ public:
     void setThreadCount(int32_t n_threads) override;
     void markRewind(void) override;
     void rewindToMark(void) override;
+    void markGeneration(std::string) override;
+    void rewindGeneration(std::string, std::vector<int> &) override;
     void queryActorNames(std::vector<std::string> &) override;
     int32_t threadCount() const override;
     std::vector<GPUDevice> availableGPUDevices(size_t memoryRequired) const override;

@@ -1067,6 +1067,8 @@ struct llama_pool {
         loose_bysize.insert(m, mem);
     }
     void *alloc(size_t sz) {
+        // shortcut: return malloc(sz);
+
         Llama_mem ptr_ref, *new_ptr;
         Llama_mem *remnant, *usable=NULL;
         ptr_ref.sz = sz;
@@ -1077,7 +1079,8 @@ struct llama_pool {
         });
         if( m != loose_bysize.end() ) {
             usable = *m;
-            if( usable->sz != sz && usable->sz < sz*2 ) {
+            if( usable->sz == sz || usable->sz >= sz*2 ) {
+            } else {
                 ptr_ref.sz = sz*2;
                 memiter m = std::lower_bound(loose_bysize.begin(), loose_bysize.end(), &ptr_ref, [](Llama_mem *a, Llama_mem *b) {
                     return a->sz < b->sz;
@@ -1086,25 +1089,28 @@ struct llama_pool {
                     usable = *m;
                 else
                     usable = NULL;
-            } else usable = NULL;
+            }
         }
         if( m != loose_bysize.end() && usable ) {
-            loose_bysize.erase(m);
+            loose_bysize.erase(m); // we have to erase because we may have changed its size
             m = std::lower_bound(loose_contig.begin(), loose_contig.end(), usable, [](Llama_mem *a, Llama_mem *b) {
-                return a->addr <= b->addr;
+                return a->addr < b->addr;
             });
+            bool found=false;
             do {
-                m--;
                 if( *m == usable ) {
                     loose_contig.erase(m);
+                    found=true;
                     break;
                 }
-            } while( m > loose_contig.begin() && (*m)->addr > usable->addr );
-            if( (*m)->addr < usable->addr ) {
+                m--;
+                if( m < loose_contig.begin() ) break;
+            } while( (*m)->addr > usable->addr );
+            if( ( (*m)->addr < usable->addr || m < loose_contig.begin() ) && !found ) {
                 LLAMA_LOG_ERROR("alloc(%zu): lost a pointer from loose_contig\n", sz);
                 LLAMA_LOG_ERROR("alloc(%zu): lost a pointer from loose_contig\n", sz);
                 LLAMA_LOG_ERROR("alloc(%zu): lost a pointer from loose_contig\n", sz);
-                PrintStackTrace();
+                //PrintStackTrace(); // pst doesn't work
                 usable = new Llama_mem();
                 usable->sz = sz;
                 usable->addr = malloc(sz);
@@ -1140,13 +1146,18 @@ struct llama_pool {
         return new_ptr->addr;
     }
     void release(void *ptr) {
+        /* shortcut:
         if( ptr == NULL ) return;
+        free(ptr);
+        return;
+        */
+
         Llama_mem ptr_ref;
         ptr_ref.addr = ptr;
         memiter m = std::lower_bound(used.begin(), used.end(), &ptr_ref, [](Llama_mem *a, Llama_mem *b) {
             return a->addr < b->addr;
         });
-        if( m == used.end() || (*m)->addr != ptr ) {
+        if( (*m)->addr != ptr || m == used.end() ) {
             LLAMA_LOG_ERROR("Invalid free of %p, used size %d\n", ptr, used.size());
             PrintStackTrace();
             //free(ptr);
@@ -1981,7 +1992,6 @@ typedef struct llama_kv_cache {
 
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
-
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
     void prepare(void)
@@ -1991,7 +2001,6 @@ typedef struct llama_kv_cache {
         new (&(v_l)) std::vector<struct ggml_tensor *>;
         new (&ctxs) std::vector<struct ggml_context *>;
         new (&bufs) std::vector<ggml_backend_buffer_t>;
-        LLAMA_LOG_INFO("Prepared kv_cache\n");
     }
 
     void *buffer( size_t len )
@@ -2002,7 +2011,7 @@ typedef struct llama_kv_cache {
 
     void read( int startpt, size_t n_tokens, void *kx, void *vx )
     {
-        size_t bufptr=0;
+        size_t bufptr;
 
         size_t v = 2 * n_tokens;
         size_t k = 1024 * v;
@@ -2010,18 +2019,14 @@ typedef struct llama_kv_cache {
         size_t st_v = 2 * startpt;
         size_t st_k = 1024 * st_v;
 
-        size_t p,q; // mind 'em
-
-        size_t p_sz = 2 * size;
+        size_t p, p_sz = 2 * size;
 
         LLAMA_LOG_INFO("kv_read: startpt %d n_tokens %zu\n", startpt, n_tokens);
 
-        for( int il=0, bufptr=0; il<32; il++, bufptr += k ) {
+        for( int il=bufptr=0; il<32; il++ ) {
             ggml_backend_tensor_get(k_l[il], (void*)((char*)kx + bufptr), st_k, k );
-        }
-        for( int i=0, p=q=0; i<1024; i++, p += p_sz, q += v ) {
-            for( int il=0, bufptr=0; il<32; il++, bufptr += v ) {
-                ggml_backend_tensor_get(v_l[il], (void*)((char*)vx + bufptr + q), st_v+p, v );
+            for( int i=p=0; i<1024; i++, p += p_sz, bufptr += v ) {
+                ggml_backend_tensor_get(v_l[il], (void*)((char*)vx + bufptr), st_v+p, v );
             }
         }
 
@@ -2045,7 +2050,7 @@ typedef struct llama_kv_cache {
 
     void write( int startpt, size_t n_tokens, void *kx, void *vx )
     {
-        size_t bufptr=0;
+        size_t bufptr;
 
         size_t v = 2 * n_tokens;
         size_t k = 1024 * v;
@@ -2053,18 +2058,13 @@ typedef struct llama_kv_cache {
         size_t st_v = 2 * startpt;
         size_t st_k = 1024 * st_v;
 
-        size_t p,q; // mind 'em
-        size_t p_sz = size*2;
+        size_t p, p_sz = size*2; // size refers to total # of tokens in this kb
 
         LLAMA_LOG_INFO("kv_write: startpt %d n_tokens %zu\n", startpt, n_tokens);
-
-        for( int il=0, bufptr=0; il<32; il++, bufptr += k*n_tokens ) {
+        for( int il=bufptr=0; il<32; il++ ) {
             ggml_backend_tensor_set(k_l[il], (void*)((char*)kx + bufptr), st_k, k );
-        }
-        for( int i=0, p=q=0; i<1024; i++, p += p_sz, q += v ) {
-            bufptr = 0;
-            for( int il=0, bufptr=0; il<32; il++, bufptr += k*n_tokens ) {
-                ggml_backend_tensor_set(v_l[il], (void*)((char*)vx + bufptr + q), st_v+p, v );
+            for( int i=p=0; i<1024; i++, p += p_sz, bufptr += v ) {
+                ggml_backend_tensor_set(v_l[il], (void*)((char*)vx + bufptr), st_v+p, v );
             }
         }
     }
@@ -2152,6 +2152,7 @@ struct llm_org_context {
             /*.mem_buffer =*/ buf_compute_meta.data(),
             /*.no_alloc   =*/ true,
         };
+        LLAMA_LOG_INFO("Prepare buf_compute_meta size %zu\n", buf_compute_meta.size());
         ctx0 = ggml_init(params);
     }
 
@@ -2192,14 +2193,15 @@ struct llm_org_context {
 
         if( buffer_size > 0 ) {
             LLAMA_LOG_INFO("%s: adjust buffer %d\n", __func__, buffer_size);
-            int size_v = buffer_size * 2;
-            int size_k = size_v * 1024;
-            int tgt_v = buffer_target * 2;
-            int tgt_k = tgt_v * 1024;
+            size_t size_v = buffer_size * 2;
+            size_t size_k = size_v * 1024;
+            size_t tgt_v = buffer_target * 2;
+            size_t tgt_k = tgt_v * 1024;
+            size_t p_size = kv_self->size * 2;
             for( int il = 0; il < 32; ++il ) { // it's the same amt of memory, 1024*overlap_v
                 ggml_backend_tensor_set(kv_self->k_l[il], k_buffer_layers[il], tgt_k, size_k );
                 for( int i=0; i<1024; i++ ) {
-                    ggml_backend_tensor_set(kv_self->v_l[il], (void*)((char*)v_buffer_layers[il]+(size_v*i)), tgt_v+(8192*i), size_v );
+                    ggml_backend_tensor_set(kv_self->v_l[il], (void*)((char*)v_buffer_layers[il]+(size_v*i)), tgt_v+(p_size*i), size_v );
                 }
                 myPool.release(k_buffer_layers[il]);
                 myPool.release(v_buffer_layers[il]);
@@ -2233,15 +2235,17 @@ struct llm_org_context {
             overlap -= ( overlap_end - from_st );
             overlap_end = from_st;
         }
-        int overlap_tgt = overlap_end + overlap; // something about this seems strange or weird or something...
-        int used_en = from_st;
-        int remnant = used_en - overlap_end;
+        size_t overlap_tgt = overlap_end + overlap; // something about this seems strange or weird or something...
+        size_t used_en = from_st;
+        size_t remnant = used_en - overlap_end;
 
-        int overlap_v = 2 * overlap;
-        int overlap_k = 1024 * overlap_v;
+        size_t overlap_v = 2 * overlap;
+        size_t overlap_k = 1024 * overlap_v;
 
-        int to_st_v = 2 * to_st;
-        int to_st_k = 1024 * to_st_v;
+        size_t to_st_v = 2 * to_st;
+        size_t to_st_k = 1024 * to_st_v;
+
+        size_t p_size = kv_self->size * 2;
 
         // record overlapping area for replay at end of run
         buffer_size = overlap;
@@ -2259,8 +2263,8 @@ struct llm_org_context {
                 k_buffer_layers[il] = myPool.alloc( overlap_k );
                 v_buffer_layers[il] = myPool.alloc( overlap_k ); // it's the same amt of memory, 1024*overlap_v
                 ggml_backend_tensor_get(kv_self->k_l[il], k_buffer_layers[il], to_st_k, overlap_k );
-                for( int i=0; i<1024; i++ ) {
-                    ggml_backend_tensor_get(kv_self->v_l[il], (void*)((char*)v_buffer_layers[il]+(overlap_v*i)), to_st_v+(8192*i), overlap_v );
+                for( size_t i=0; i<1024; i++ ) {
+                    ggml_backend_tensor_get(kv_self->v_l[il], (void*)((char*)v_buffer_layers[il]+(overlap_v*i)), to_st_v+(p_size*i), overlap_v );
                 }
             }
 
@@ -2601,6 +2605,7 @@ char toLowerCase(char c)
     }
     return c;
 }
+void llama_quick_tokenize( std::string raw_text, std::vector<llama_vocab::id> &output );
 
 
 
@@ -2611,6 +2616,9 @@ struct system_memory {
     std::string who;
     System_timestamp *when=NULL;
 
+    uint16_t n_tokens;
+    std::vector<int> tokens;
+
     //std::string where; // add with location
 
     void prepare()
@@ -2618,15 +2626,19 @@ struct system_memory {
         new (&what) std::string;
         new (&who) std::string;
         new (&keywords) std::set<std::string>;
+        new (&tokens) std::vector<int>;
+        n_tokens=0;
     }
     void release()
     {
         keywords.clear();
+        tokens.clear();
     }
     void readfile( llama_file &file )
     {
         who = file.read_string();
         what = file.read_string();
+        n_tokens = file.read_u16();
         std::string strWhen = file.read_string();
 
         when = llama_string_to_ts(strWhen);
@@ -2639,6 +2651,7 @@ struct system_memory {
         //file.write_u16(sign);
         file.write_string(who);
         file.write_string(what);
+        file.write_u16(n_tokens);
         file.write_string(when->to_string());
     }
 
@@ -2647,6 +2660,8 @@ struct system_memory {
         who = actor;
         when = llama_ts_now();
         what = input;
+
+        llama_quick_tokenize( what, tokens );
 
         buildsearch();
     }
@@ -2671,7 +2686,7 @@ struct system_memory {
                     wptr=word;
                     *wptr='\0';
                 }
-                if( !c ) break;
+                if( c == '\0' ) break;
             } else {
                 *wptr = toLowerCase(c);
                 wptr++;
@@ -2686,20 +2701,20 @@ struct system_memory {
         }
     }
 
-    bool scan( std::vector<std::string *> search, int require )
+    int scan( std::vector<std::string *> search )
     {
         std::vector<std::string *>::iterator it;
+        int results=0;
 
         for( it = search.begin(); it != search.end(); it++ ) {
             std::string *keyword = *it;
 
             if( keywords.find(*keyword) != keywords.end() ) {
-                require--;
-                if( require <= 0 ) return true;
+                results++;
             }
         }
 
-        return false;
+        return results;
     }
 };
 
@@ -2720,6 +2735,7 @@ struct system_eidet {
         new (&what) std::string;
         new (&who) std::string;
         new (&keywords) std::set<std::string>;
+        n_tokens = 0;
     }
 
     void release()
@@ -2745,8 +2761,6 @@ struct system_eidet {
 
         file.read_raw( kbuf, 32*2048*n_tokens );
         file.read_raw( vbuf, 32*2048*n_tokens );
-
-        buildsearch();
     }
     void writefile( llama_file &file )
     {
@@ -2766,64 +2780,12 @@ struct system_eidet {
         what = input;
         when = llama_ts_now();
 
+        //LLAMA_LOG_INFO("build eidet: %d start +%d tokens\n", start, used_tokens);
+
         n_tokens = used_tokens; /// read in the used tokens:
         kbuf = (ggml_fp16_t*)myPool.alloc( 32 * 2048 * n_tokens );
         vbuf = (ggml_fp16_t*)myPool.alloc( 32 * 2048 * n_tokens );
         kv->read( start, used_tokens, (void*)kbuf, (void*)vbuf);
-
-        buildsearch();
-    }
-    void buildsearch( void )
-    {
-        char word[128], *wptr;
-        wptr = word;
-        *wptr = '\0';
-
-        LLAMA_LOG_INFO("%s: eidet what=%s\n", __func__, what.c_str());
-
-        int iptr, len = what.length();
-        char c;
-
-        for( iptr=0; iptr<len; iptr++ ) {
-            c = what[iptr]; // = what.c_str() ;; instr++ ) {
-            if( c == ' ' || c == '\n' || c == 0 ) {
-                if( *word != '\0' ) {
-                    *wptr='\0';
-                    //LLAMA_LOG_INFO("%s: add keyword %s\n", __func__, word);
-                    keywords.insert( std::string(word) );
-                    wptr=word;
-                    *wptr='\0';
-                }
-                if( !c ) break;
-            } else {
-                // if isalpha blah blah blah
-                *wptr = c; // to lowercase blah blah blah
-                wptr++;
-            }
-        }
-        if( *word != '\0' ) {
-            *wptr='\0';
-            //LLAMA_LOG_INFO("%s: add keyword %s\n", __func__, word);
-            keywords.insert( std::string(word) );
-            wptr=word;
-            *wptr='\0';
-        }
-    }
-
-    bool scan( std::vector<std::string *> search, int require )
-    {
-        std::vector<std::string *>::iterator it;
-
-        for( it = search.begin(); it != search.end(); it++ ) {
-            std::string *keyword = *it;
-
-            if( keywords.find(*keyword) != keywords.end() ) {
-                require--;
-                if( require <= 0 ) return true;
-            }
-        }
-
-        return false;
     }
 
     int write( Kv_cache *kv, int start )
@@ -2850,6 +2812,7 @@ struct system_eidet {
 };
 typedef struct kv_mem {
     bool is_full = false;
+    bool is_active = false;
     System_memory *m=NULL;
     System_eidet *e=NULL;
     uint16_t first; // token location
@@ -2860,6 +2823,7 @@ typedef struct kv_mem {
         m = NULL;
         e = NULL;
         is_full = false;
+        is_active = false;
         first = last = 0;
     }
 
@@ -2895,18 +2859,19 @@ typedef struct kv_mem {
         }
     }
 
-    void release()
+    void release(bool release_contents=true)
     {
-        if( m != NULL ) {
+        if( m != NULL && release_contents ) {
             m->release();
             myPool.release(m);
-            m=NULL;
         }
-        if( e != NULL ) {
+        m=NULL;
+        if( e != NULL && release_contents ) {
             e->release();
             myPool.release(e);
-            e=NULL;
         }
+        e=NULL;
+        is_active = is_full = false;
     }
 } Kv_mem;
 
@@ -2919,9 +2884,34 @@ void llama_backup_file( const char *filepath )
     FILE *fp;
     char fp2[256];
     int backupno=0;
+    char parsed_path[256], parsed_fn[256];
+
+    fp = fopen(filepath, "rb");
+    if( fp ) {
+        fclose(fp);
+    } else {
+        return;
+    }
+
+    const char *ptr;
+    int len = strlen(filepath), len2;
+    for( ptr = filepath+len-1; ptr != filepath; ptr-- ) {
+        if( *ptr == '/' ) {
+            len2 = ptr-filepath;
+            strncpy(parsed_path, filepath, len2);
+            parsed_path[len2] = '\0';
+            strncpy(parsed_fn, filepath+(len2)+1, len-(len2+1) );
+            parsed_fn[ len - (len2+1) ] = '\0';
+            break;
+        }
+    }
+    if( !*parsed_fn ) {
+        *parsed_path = '\0';
+        strcpy(parsed_fn, filepath);
+    }
 
     while(true) {
-        sprintf(fp2, "%d_%s", backupno, filepath);
+        sprintf(fp2, "%s/%d_%s", parsed_path, backupno, parsed_fn);
         fp = fopen(fp2, "rb");
         if( !fp ) break;
         fclose(fp);
@@ -2979,9 +2969,11 @@ struct system_actor {
     std::string name;
     System_eidet *self=NULL; // self description data
     bool self_changed=false;
+    Kv_mem *mine=NULL;
     std::vector<Kv_mem *> mem; // identity variables & persona variables
     bool mem_changed=false;
     std::vector<Kv_mem *> rags;
+    std::set<std::string> ragged; // already in rags
     bool rags_changed=false;
     std::vector<Kv_mem *> history; // things you have seen happen long ago (used for pulling RAG)
     std::vector<Kv_mem *> recent; // things you have seen happen recently
@@ -2995,6 +2987,8 @@ struct system_actor {
         new (&history) std::vector<Kv_mem *>; // things you have seen happen long ago (used for pulling RAG)
         new (&recent) std::vector<Kv_mem *>;
         new (&keys) std::unordered_map<std::string, Kv_mem*>;
+        mine=NULL;
+        self=NULL;
         self_changed=rags_changed=mem_changed=false;
     }
 
@@ -3026,10 +3020,11 @@ struct system_actor {
             m->release();
         }
         rags.clear();
+        ragged.clear();
 
-        if( self != NULL ) {
-            self->release(); // oops! ;)
-            self = NULL;
+        if( mine != NULL ) {
+            mine->release();
+            mine = NULL;
         }
     }
 
@@ -3050,6 +3045,12 @@ struct system_actor {
         recent.push_back(mem);
         return mem;
     }
+    Kv_mem *addrecent(System_memory *m)
+    {
+        Kv_mem *mem = new_kv_mem(m);
+        recent.push_back(mem);
+        return mem;
+    }
     Kv_mem *addhist(System_memory *hist)
     {
         Kv_mem *m = new_kv_mem(hist);
@@ -3062,6 +3063,7 @@ struct system_actor {
     {
         Kv_mem *mem = new_kv_mem(rag);
         rags.push_back(mem);
+        ragged.insert( rag->what );
         return mem;
     }
     Kv_mem *addmem(System_eidet *m)
@@ -3097,10 +3099,14 @@ struct system_actor {
         Kv_mem *m;
 
         if( playerfile.fp != NULL ) {
-            self = (System_eidet*)myPool.alloc(sizeof(*self));
-            new (self) System_eidet;
-            self->prepare();
-            self->readfile(playerfile);
+            uint16_t self_found = playerfile.read_u16();
+            if( self_found == 1 ) {
+                self = (System_eidet*)myPool.alloc(sizeof(*self));
+                new (self) System_eidet;
+                self->prepare();
+                self->readfile(playerfile);
+                mine = new_kv_mem(self);
+            }
         }
 
         loadmemories(ragpath, rags);
@@ -3123,7 +3129,12 @@ struct system_actor {
         strcat(filepath, ".def");
         llama_backup_file(filepath);
         llama_file datafile(filepath, "wb");
-        self->writefile(datafile);
+        if( mine ) {
+            datafile.write_u16(1);
+            mine->e->writefile(datafile);
+        } else {
+            datafile.write_u16(0);
+        }
 
         char *mempath = (char*) myPool.alloc(strlen(rootpath) + 5);
         strcpy(mempath, rootpath);
@@ -3155,15 +3166,22 @@ struct system_actor {
         std::vector<Kv_mem*> *res;
         uint16_t token=0;
 
-        res = (std::vector<Kv_mem*> *)myPool.alloc(sizeof(*res));
+        LLAMA_LOG_INFO("%s: build map 1\n", __func__);
+        res = (std::vector<Kv_mem*> *)myPool.alloc(sizeof(std::vector<Kv_mem*>));
         new (res) std::vector<Kv_mem*>;
 
-        if( self ) {
-            me = new_kv_mem(self);
-            me->first = 0; //! when we first translate the self memory we will need to record the BOS as well.
-            me->last = self->n_tokens-1;
-            token = self->n_tokens;
+        if( mine ) {
+            // note: we use a new copy instead of the old copy to make sure nothing has moved or changed shape.
+            // if we use the same pointer the comparison will not work.
+            me = new_kv_mem(mine->e);
+            me->first = 0;
+            me->last = mine->e->n_tokens-1;
+            token = mine->e->n_tokens;
+            if( mine->is_active && mine->first == me->first && mine->last == me->last ) {
+                me->is_active = true;
+            }
             res->push_back( me );
+            LLAMA_LOG_INFO("set token after self=%zu\n", token);
         }
 
         for( it = mem.begin(); it != mem.end(); it++ ) {
@@ -3172,68 +3190,107 @@ struct system_actor {
             me = new_kv_mem(src->e);
             me->first = token;
             me->last = token + src->e->n_tokens-1;
+            if( src->is_active && me->first == src->first ) {
+                me->is_active = true; // already written in this placement
+            }
             token = me->last+1;
 
             res->push_back( me );
+            LLAMA_LOG_INFO("%s: add mem %zu-%zu\n", __func__, me->first, me->last);
         }
 
         for( it = rags.begin(); it != rags.end(); it++ ) {
             src = *it;
 
-            me = new_kv_mem(src->m);
-            me->first = me->last = 0;
+            if( src->is_full ) {
+                me = new_kv_mem(src->e);
+                me->first = src->first;
+                me->last = src->last;
+            } else {
+                me = new_kv_mem(src->m);
+                me->first = me->last = 0;
+            }
+            if( src->is_active && me->is_full && me->first == src->first ) {
+                me->is_active = true; // already written in this placement
+            }
 
             res->push_back( me );
+            LLAMA_LOG_INFO("%s: add rag %zu-%zu\n", __func__, me->first, me->last);
         }
 
         return res;
     }
 
-    void build_map2( uint16_t use_space, std::vector<Kv_mem*> *res )
+    std::vector<System_memory*> *build_map2( uint16_t use_space, std::vector<Kv_mem*> *res )
     {
-        Kv_mem *me, *src;;
+        Kv_mem *me, *src;
         uint16_t token = 0;
-        LLAMA_LOG_INFO("%s: build map 2\n", __func__);
+        LLAMA_LOG_INFO("%s: build map 2 use %zu\n", __func__, use_space);
         if( res->size() > 0 ) {
             src = res->at( res->size()-1 );
             token = src->last+1;
         }
-        std::vector<Kv_mem*>::iterator it;
-        std::vector<Kv_mem*>::iterator itBoundary = res->end(), itBound2;
+        int it;
+        int itBoundary = res->size(), itBound2;
         uint16_t token_cpy = token;
 
         // insert history in reverse from end to beginning as far as we can go
-        for( it = recent.end(); it != recent.begin(); ) {
-            it--;
-            src = *it;
+        LLAMA_LOG_INFO("Recent entries: %zu\n", recent.size());
+        for( it = recent.size()-1; it >= 0; it-- ) {
+            src = recent[it];
 
-            if( token+src->e->n_tokens > use_space ) break;
-            token += src->e->n_tokens;
-
-            me = new_kv_mem(src->e);
-            res->insert( itBoundary, me );
+            if( !src->is_full ) {
+                LLAMA_LOG_INFO("!src->is_full\n");
+                if( token+src->m->n_tokens > use_space ) break;
+                me = new_kv_mem(src->m);
+                me->first = token;
+                me->last = token + src->m->n_tokens-1;
+                me->is_active = false;
+                token = me->last+1;
+                res->insert( res->begin()+itBoundary, me );
+            } else {
+                if( token+src->e->n_tokens > use_space ) break;
+                me = new_kv_mem(src->e);
+                me->first = token;
+                me->last = token + src->e->n_tokens - 1;
+                if( src->is_active && me->first == src->first ) {
+                    me->is_active=true;
+                }
+                token = me->last+1;
+                res->insert( res->begin()+itBoundary, me );
+            }
         }
-        itBound2 = history.end();
-        while( it != recent.begin() ) { // move overflow to history
-            it--;
-            src = *it;
+        itBound2 = history.size();
+        std::vector<System_memory*> *histcopy;
+        histcopy = (std::vector<System_memory*>*)myPool.alloc(sizeof(*histcopy));
+        new (histcopy) std::vector<System_memory*>;
+
+        if( it >= 0 )
+            LLAMA_LOG_INFO("Move %d recent entries to history.\n", (it+1));
+        while( it >= 0 ) { // move overflow to history
+            src = recent[it];
             me = new_kv_mem((System_memory*)myPool.alloc(sizeof(*(me->m))));
             new (me->m) System_memory;
             me->m->prepare();
             me->m->build( src->e->who, src->e->what );
-            history.insert(itBound2, me);
+            me->is_active = false;
+            history.insert(history.begin() + itBound2, me);
+            histcopy->insert(histcopy->begin(), me->m);
 
-            recent.erase(it);
+            recent.erase(recent.begin()+it);
+            it--;
         }
 
         token = token_cpy; // final token count & organize results:
-        for( it = itBoundary; it != res->end(); it++ ) {
-            src = *it;
+        for( it = itBoundary; it < res->size(); it++ ) {
+            src = res->at(it);
             src->first = token;
             token += src->e->n_tokens;
             src->last = token - 1;
         }
         LLAMA_LOG_INFO("%s: done\n", __func__);
+
+        return histcopy;
     }
 };
 
@@ -3423,15 +3480,16 @@ struct llama_context {
 };
 
 void prepare_kv_cache(struct llama_context *ctx, int n_ctx, int n_batch);
-void llama_quick_tokenize( std::string raw_text, std::vector<llama_vocab::id> &output );
 
 typedef struct system_kb System_kb;
 struct system_kb {
     std::vector<System_actor*> actors;
     std::unordered_map<std::string, System_actor*> players;
-    std::unordered_map<std::string, std::vector<Kv_mem*>> ragwordmap;
+    std::unordered_map<std::string, std::vector<System_memory*> *> ragwordmap;
     std::vector<Kv_mem*> allmessages;
     struct llama_kv_cache kv[3];
+
+    std::string writinguser;
 
     uint16_t kv_extent[3] = {0,0,0};
     uint16_t seq_start[3] = {0,0,0};
@@ -3440,7 +3498,29 @@ struct system_kb {
     bool kv_ready[3] = {false,false,false};
     uint8_t current_kv;
     int16_t seq_mark[3] = {-1,-1,-1};
+    int16_t gen_mark[3] = {-1,-1,-1};
 
+    void prepare(void)
+    {
+        new (&actors)     std::vector<System_actor*>;
+        new (&players) std::unordered_map<std::string, System_actor*>;
+        new (&ragwordmap) std::unordered_map<std::string, std::vector<Kv_mem*>> ;
+        new (&active_actor) std::string;
+        new (&allmessages) std::vector<Kv_mem*>;
+
+        for( int i=0; i<3; i++ ) {
+            new (&(kv[i])) struct llama_kv_cache;
+            //kv[i].prepare();
+            kv_extent[i] = 0;
+            seq_start[i] = 0;
+            kvmap[i] = NULL;
+            kvuser[i] = NULL;
+            kv_ready[i] = false;
+        }
+        new (&writinguser) std::string;
+        writinguser = "";
+        LLAMA_LOG_INFO("%s: prepared system_kb\n", __func__);
+    }
     void mark_rewind(void)
     {
         for( int i=0; i<3; i++ ) {
@@ -3453,6 +3533,55 @@ struct system_kb {
             seq_start[i] = seq_mark[i];
             seq_mark[i] = -1;
         }
+    }
+    void mark_generation(std::string author)
+    {
+        writinguser = author;
+        for( int i=0; i<3; i++ ) {
+            gen_mark[i] = seq_start[i];
+        }
+    }
+    void rewind_generation(std::string message, std::vector<int> &tokens)
+    {
+        // create memories:
+        std::set<System_actor *> messaged;
+        llama_quick_tokenize( message, tokens );
+        for( int i=0; i<3; i++ ) {
+            if( !kv_ready[i] || !kvuser[i] ) {
+                gen_mark[i] = -1;
+                continue;
+            }
+
+            Kv_mem *mem;
+            System_eidet *eid = (System_eidet*)myPool.alloc(sizeof(*eid));
+            new (eid) System_eidet;
+            eid->prepare();
+
+            // read from current_kv and build eidet
+            eid->build(&(kv[i]), writinguser, message, gen_mark[i], tokens.size());
+            // add to source
+            mem = kvuser[i]->addrecent(eid);
+            mem->is_active = true;
+            messaged.insert(kvuser[i]);
+
+            gen_mark[i] = -1;
+        }
+
+        ragunmap(message); // search for any ragged messages in the past
+
+        std::vector<System_actor *>::iterator it;
+        for( it = actors.begin(); it != actors.end(); it++ ) {
+            if( messaged.contains( *it ) ) continue;
+
+            System_actor *a = *it;
+            System_memory *m = (System_memory*)myPool.alloc(sizeof(*m));
+            new (m) System_memory;
+            m->prepare();
+            m->build(writinguser, message);
+            a->addrecent(m);
+        }
+
+        writinguser = "";
     }
     void query_actor_names(std::vector<std::string> &names)
     {
@@ -3475,24 +3604,34 @@ struct system_kb {
         allmessages.push_back(memitem);
         return memitem;
     }
-
-    void prepare(void)
+    void freemem(Kv_mem *memitem, bool withmem)
     {
-        new (&actors)     std::vector<System_actor*>;
-        new (&players) std::unordered_map<std::string, System_actor*>;
-        new (&ragwordmap) std::unordered_map<std::string, std::vector<Kv_mem*>> ;
-        new (&active_actor) std::string;
-        for( int i=0; i<3; i++ ) {
-            new (&(kv[i])) struct llama_kv_cache;
-            //kv[i].prepare();
-            kv_extent[i] = 0;
-            seq_start[i] = 0;
-            kvmap[i] = NULL;
-            kvuser[i] = NULL;
-            kv_ready[i] = false;
+        std::vector<Kv_mem*>::iterator it;
+        for( it = allmessages.begin(); it != allmessages.end(); it++ ) {
+            if( *it == memitem ) {
+                allmessages.erase(it);
+                break;
+            }
         }
-        LLAMA_LOG_INFO("%s: prepared system_kb\n", __func__);
+        memitem->release(withmem);
+        myPool.release(memitem);
     }
+    void freemems(std::set<Kv_mem *>items, bool withmem)
+    {
+        size_t it;
+        Kv_mem *memitem;
+
+        for( it = 0; it < allmessages.size(); it++ ) {
+            if( items.contains(allmessages[it]) ) {
+                memitem = allmessages[it];
+                allmessages.erase(allmessages.begin() + it);
+                it--;
+                memitem->release(withmem);
+                myPool.release(memitem);
+            }
+        }
+    }
+
     llama_hparams           hparams;
 
     std::string active_actor;
@@ -3546,6 +3685,7 @@ struct system_kb {
             if( kvmap[i] != NULL ) {
                 for( itMap = kvmap[i]->begin(); itMap != kvmap[i]->end(); itMap++ ) {
                     eid = *itMap;
+                    eid->release(false);
                     myPool.release(eid);
                 }
                 delete kvmap[i];
@@ -3563,19 +3703,25 @@ struct system_kb {
 
     struct llama_kv_cache *usekv( int kvno )
     {
-        if( current_kv == kvno ) return &(kv[kvno]);
         current_kv = kvno;
 
-        LLAMA_LOG_INFO("%s: use kv %d (actor %s)\n", __func__, kvno, kvno==0?"System":kvuser[kvno]->name.c_str());
+        if( !kvuser[kvno] ) {
+            if( kvno == 0 ) {
+                useactor("System");
+            } else {
+                LLAMA_LOG_INFO("usekv %d: no actor found!\n", kvno);
+                throw "Actor not resolved.";
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: use kv %d (actor %s)\n", __func__, kvno, kvuser[kvno]->name.c_str());
 
         if( !kv_ready[kvno] ) {
             int n = kvno;
             int n_ctx = n==0?1024:4096;
 
             kv_extent[n] = n_ctx;
-            LLAMA_LOG_INFO("%s: preparing kv %d\n", __func__, n);
             kv[n].prepare();
-            LLAMA_LOG_INFO("%s: prepared kv %d\n", __func__, n);
 
             current_context->kv_self = &(kv[n]);
             current_context->cparams.n_ctx = kv_extent[n];
@@ -3589,6 +3735,7 @@ struct system_kb {
 
             current_context->kv_self = &(kv[n]);
             prepare_kv_cache(current_context, n_ctx, n_batch);
+            LLAMA_LOG_INFO("%s: prepared kv %d\n", __func__, n);
 
             seq_start[n] = 0;
 
@@ -3618,7 +3765,7 @@ struct system_kb {
         return &kv[kvno];
     }
 
-    void usemap( int kvno, std::vector<Kv_mem*> *map )
+    void usemap( int kvno, std::vector<Kv_mem*> *map, bool finalize )
     {
         std::vector<Kv_mem*>::iterator it, it1, it2;
         Kv_mem *e1, *e2, *eid;
@@ -3628,27 +3775,35 @@ struct system_kb {
 
         bool wrote = false;
 
-        // decide where everything goes
+        // decide where everything goes (including partial memories)
         int token=0;
-        LLAMA_LOG_INFO("%s: map has %d entries.\n", __func__, map->size());
+        if( map->size() > 0 )
+            LLAMA_LOG_INFO("%s: map kv(%d) has %d entries.\n", __func__, kvno, map->size());
+
         for( it = map->begin(); it != map->end(); it++ ) {
             eid = *it;
             if( eid->first == 0 ) {
                 eid->first = token;
-                eid->last = token + eid->e->n_tokens - 1;
+                if( eid->e ) {
+                    eid->last = token + eid->e->n_tokens - 1;
+                } else {
+                    eid->last = token + eid->m->n_tokens - 1;
+                }
             }
             token = eid->last+1;
         }
 
-        // anything in the old map that exists in the new map will be 'movable'
         std::set<Kv_mem*> movable;
         std::unordered_map<Kv_mem*, Kv_mem*> new_to_old;
         if( prev ) {
+            // anything in the old map that exists in the new map will be 'movable'
+            // unless it is already written in the proper location
             for( it1 = prev->begin(); it1 != prev->end(); it1++ ) {
                 e1 = *it1;
                 for( it2 = map->begin(); it2 != map->end(); it2++ ) {
                     e2 = *it2;
-                    if( e1->e == e2->e ) { // they must be literally the same pointer
+                    if( !e2->e || e2->is_active ) continue;
+                    if( e1->e == e2->e ) { // they must be literally the same pointer internally
                         movable.insert(e2);
                         new_to_old[e2] = e1;
                         break;
@@ -3656,21 +3811,27 @@ struct system_kb {
                 }
             }
         }
+        if( movable.size() != 0 )
+            LLAMA_LOG_INFO("Movable entries: %zu\n", movable.size());
 
         // setup a plan to move movable memories
         std::set<Kv_mem*> moving;
 
         // first loop: check for anything that can be moved into non-reserved areas
+        // anything that passes this first check or the second check below goes into 'moving'
         bool found=false;
         for( it = map->begin(); it != map->end(); it++ ) {
             eid = *it;
+            if( !eid->e || eid->is_active ) continue;
             if( movable.contains(eid) ) {
-                for( it1 = map->begin(); it1 != map->end(); it1++ ) {
+                found=false;
+                for( it1 = prev->begin(); it1 != prev->end(); it1++ ) { // check for overlaps:
                     e1 = *it1;
-                    if( e1 == eid ) continue;
-
                     if( ( eid->first >= e1->first && eid->first <= e1->last ) ||
                         ( eid->last >= e1->first && eid->last <= e1->last ) ) {
+                        if( eid->e == e1->e && eid->first == e1->first ) {
+                            continue;
+                        }
                         found=true;
                         break;
                     }
@@ -3684,16 +3845,17 @@ struct system_kb {
         // second loop: weigh options between moving and writing directly
         found=false;
         std::set<System_eidet*> removed;
-        std::vector<Kv_mem*> removing;
-        std::vector<Kv_mem*>::iterator it3;
+        std::vector<System_eidet*> removing;
+        std::vector<System_eidet*>::iterator it3;
 
         for( it = map->begin(); it != map->end(); it++ ) {
             eid = *it;
+            if( !eid->e || eid->is_active ) continue;
             if( movable.contains(eid) && !moving.contains(eid) && !removed.contains(eid->e) ) {
                 // locate what we are removing
                 int weight_for = eid->e->n_tokens;
                 removing.clear();
-                for( it1 = map->begin(); it1 != map->end(); it1++ ) {
+                for( it1 = prev->begin(); it1 != prev->end(); it1++ ) {
                     e1 = *it1;
                     if( ( eid->first >= e1->first && eid->first <= e1->last ) ||
                         ( eid->last >= e1->first && eid->last <= e1->last ) ) {
@@ -3701,8 +3863,7 @@ struct system_kb {
                         int weight_counter = e1->e->n_tokens;
                         for( it2 = map->begin(); it2 != map->end(); it2++ ) {
                             e2 = *it2;
-                            if( e2 == eid || e2 == e1 ) continue;
-                            if( !movable.contains(e2) ) continue;
+                            if( e2->e == eid->e || e2->e == e1->e ) continue;
                             int overlap = 0;
                             if( e1->first >= e2->first && e1->first <= e2->last ) {
                                 if( e1->last < e2->last ) {
@@ -3722,56 +3883,95 @@ struct system_kb {
                             weight_counter -= overlap;
                         }
                         weight_for -= weight_counter;
-                        removing.push_back(e1); // make sure we don't try to move this one
+                        removing.push_back(e1->e); // make sure we don't try to move this one
                     }
                 }
                 if( weight_for > 0 ) {
                     moving.insert(eid);
                     for( it3 = removing.begin(); it3 != removing.end(); it3++ ) {
-                        e2 = *it3;
-                        removed.insert( e2->e );
+                        removed.insert( *it3 );
                     }
                 }
             }
         }
 
-        LLAMA_LOG_INFO("%s: prepare llm for shift\n", __func__);
+        if( moving.size() != 0 )
+            LLAMA_LOG_INFO("Moving entries: %zu\n", moving.size());
+
+        //LLAMA_LOG_INFO("%s: prepare llm for shift\n", __func__);
         Org_context llm(&kv[kvno], current_context->buf_compute_meta, current_context->sched, hparams);
         bool initialized=false;
-        // finish by moving memories that can be shuffled around
+        // shuffle memories that can be moved
         n_tokens=0;
         for( it = map->begin(); it != map->end(); it++ ) {
             eid = *it;
-            if( movable.contains(eid) && !removed.contains(eid->e) ) {
+            if( !eid->e || eid->is_active ) continue;
+            if( moving.contains(eid) && !removed.contains(eid->e) ) {
                 e1 = new_to_old[eid];
                 if( !initialized ) {
                     llm.init();
                     initialized=true;
                 }
-                llm.shuffle_kv( e1->first, 1+e1->last-e1->first, e1->first-eid->first );
+                if( e1->first != eid->first ) {
+                    llm.shuffle_kv( e1->first, 1+e1->last-e1->first, e1->first-eid->first );
+                    wrote=true;
+                }
                 n_tokens = n_tokens>=eid->last+1?n_tokens:eid->last+1;
-                wrote = true;
             }
         }
-        if( initialized ) {
+        if( initialized && wrote ) {
             LLAMA_LOG_INFO("%s: run shuffler\n", __func__);
             llm.run_kv_shuffler();
+        }
+        if( initialized ) {
+            LLAMA_LOG_INFO("%s: release shuffler\n", __func__);
             llm.free();
         }
 
         // write unmovable memories
         for( it = map->begin(); it != map->end(); it++ ) {
             eid = *it;
+            if( !eid->is_full || eid->is_active ) continue;
             if( !movable.contains(eid) || removed.contains(eid->e) ) {
-                eid->e->write(&(kv[kvno]), token);
+                eid->e->write(&(kv[kvno]), eid->first);
+                //LLAMA_LOG_INFO("%s: write complete\n", __func__);
                 n_tokens = n_tokens>=eid->last+1?n_tokens:eid->last+1;
                 wrote = true;
             }
         }
 
-        kvmap[kvno] = map;
-        kv[kvno].seq = current_context->seq_end = n_tokens;
-        seq_start[kvno] = n_tokens;
+
+        // translate any partial memories into the kb
+        bool writing_partial=false;
+        for( it = map->begin(); it != map->end(); it++ ) {
+            eid = *it;
+            if( eid->is_full ) continue;
+
+            if( !writing_partial ) {
+                LLAMA_LOG_INFO("%s: write partial memories\n", __func__);
+                writing_partial=true;
+            }
+
+            translate_inplace(kvno, kvuser[kvno], eid, eid->m->tokens);
+
+            // release the partial memory
+            eid->m->release();
+            myPool.release(eid->m);
+            eid->m = NULL;
+        }
+
+        if( finalize ) {
+            LLAMA_LOG_INFO("%s: finalize (transfer map)\n", __func__);
+            kvmap[kvno] = map;
+        }
+        if( map->size() == 0 ) { // reset n_tokens... the previous methods skip over counting some entries
+            n_tokens = 0;
+        } else {
+            eid = *( map->begin() + map->size()-1 );
+            n_tokens = eid->last+1;
+        }
+        seq_start[kvno] = kv[kvno].seq = current_context->seq_end = n_tokens;
+        //LLAMA_LOG_INFO("%s: done\n", __func__);
     }
 
     uint8_t useactor( std::string actorname )
@@ -3783,6 +3983,7 @@ struct system_kb {
 
         uint8_t tgt_kv;
         a = getactor(actorname);
+        LLAMA_LOG_INFO("useactor(%s)\n", actorname.c_str());
 
         if( is_system_user ) {
             tgt_kv=0;
@@ -3802,43 +4003,135 @@ struct system_kb {
             kvuser[tgt_kv] = a;
         }
 
-        uint16_t reserve_space=440;
+        uint16_t reserve_space=130;
         usekv(tgt_kv);
         if( kv[tgt_kv].size <= 1024 )
-            reserve_space = 330;
+            reserve_space = 68;
 
         uint16_t use_space = kv[tgt_kv].size - reserve_space;
 
         // generate a's map
+        //! Todo: maintain the map instead of building it every time we select an actor
         std::vector<Kv_mem*> *eidmap = a->build_map1();
-        usemap( tgt_kv, eidmap );
-        a->build_map2(use_space, eidmap);
-        usemap( tgt_kv, eidmap );
+        usemap( tgt_kv, eidmap, false );
+        std::vector<System_memory*> *new_histories = a->build_map2(use_space, eidmap);
+        usemap( tgt_kv, eidmap, true );
+
+        // add to ragwordmap if memories were cycled
+        std::string srch;
+        std::vector<System_memory*>::iterator it;
+        for( it = new_histories->begin(); it != new_histories->end(); it++ ) {
+            System_memory *m = *it;
+            for( auto srch : m->keywords ) {
+                std::vector<System_memory *> *x;
+
+                if( ragwordmap.contains(srch) ) {
+                    x = ragwordmap.at(srch);
+                } else {
+                    x = (std::vector<System_memory *>*)myPool.alloc(sizeof(std::vector<System_memory *>*));
+                    new (x) std::vector<System_memory *>;
+                    ragwordmap[srch]=x;
+                }
+                x->push_back( m );
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: pick %s\n", __func__, actorname.c_str());
 
         return tgt_kv;
+    }
+
+    void ragunmap( std::string what )
+    {
+        std::unordered_map< std::string, std::vector<System_memory *> *> results;
+        std::string *pstr;
+
+        char word[128], *wptr;
+        wptr = word;
+        *wptr = '\0';
+
+        LLAMA_LOG_INFO("%s: unmap what=%s\n", __func__, what.c_str());
+
+        int iptr, len = what.length();
+        char c;
+
+        for( iptr=0; iptr<len; iptr++ ) {
+            c = what[iptr];
+            //LLAMA_LOG_INFO("%s: char=%c\n", __func__, c);
+            if( c == ' ' || c == '\n' || c == 0 ) {
+                if( *word != '\0' ) {
+                    *wptr='\0';
+                    if( ragwordmap.contains(word) && !results.contains(word) ) {
+                        results[word] = ragwordmap[word];
+                    }
+                    wptr=word;
+                    *wptr='\0';
+                }
+                if( c == '\0' ) break;
+            } else {
+                *wptr = toLowerCase(c);
+                wptr++;
+            }
+        }
+        if( *word != '\0' ) {
+            *wptr='\0';
+            if( ragwordmap.contains(word) && !results.contains(word) ) {
+                results[word] = ragwordmap[word];
+            }
+            wptr=word;
+            *wptr='\0';
+        }
+
+        std::unordered_map<System_memory *, int> counts;
+        std::vector<System_memory *>::iterator it;
+        for( const auto &pair : results ) {
+            for( it = pair.second->begin(); it != pair.second->end(); it++ ) {
+                if( !(counts.contains(*it)) )
+                    counts[*it]=1;
+                else
+                    counts[*it] = counts[*it]+1;
+            }
+        }
+        int desired_adds=2;
+        System_memory *highest;
+        std::vector<System_actor *>::iterator itAct;
+        while( desired_adds > 0 ) {
+            int highest_count=0;
+            for( const auto &pair : counts ) {
+                if( pair.second > highest_count ) {
+                    highest_count = pair.second;
+                    highest = pair.first;
+                }
+            }
+            LLAMA_LOG_INFO("%s: unmap highest=%d\n", __func__, highest_count);
+            if( highest_count == 0 ) break;
+            counts[highest] = 0;
+            desired_adds--;
+            // add rag to actors' maps
+            // note we are adding to all actors, if in the future messages are sent to one actor and not
+            // another we will want to change that.
+            for( itAct = actors.begin(); itAct != actors.end(); itAct++ ) {
+                Kv_mem *memitem = getmem();
+                LLAMA_LOG_INFO("%s: unmap memory=%s\n", __func__, highest->what.c_str());
+                System_actor *a = *itAct;
+                if( a->ragged.contains(memitem->m->what) ) continue;
+                a->ragged.insert(memitem->m->what);
+                memitem->e = translate(*itAct, highest);
+                a->rags.push_back( memitem );
+                a->rags_changed = true;
+            }
+        }
     }
 
     System_eidet *translate(System_actor *act, System_memory *mem)
     {
         std::vector<llama_token> tokens;
 
-        //! load in the actor if not loaded
-        int i;
-        uint8_t tgt_kv;
-        bool found=false;
-
-        for( i=0;i<3;i++ ) {
-            if( kvuser[i] == act ) {
-                found=true;
-                tgt_kv = i;
-                break;
-            }
-        }
-        if( !found )
-            tgt_kv = useactor(act->name);
+        // load in the actor if not loaded
+        useactor(act->name);
 
         Kv_mem *newmem;
-        if( !(newmem=processtokens(tgt_kv, mem->who, mem->what, tokens)) )
+        if( !(newmem=processtokens(mem->who, mem->what, tokens, false, 0)) )
         {
             LLAMA_LOG_INFO("%s: failed to translate %s\n", __func__, mem->what.c_str());
             throw "Couldn't translate tokens\n";
@@ -3846,9 +4139,18 @@ struct system_kb {
 
         return newmem->e;
     }
+    void translate_inplace(uint8_t tgt_kv, System_actor *act, Kv_mem *mem, std::vector<int> &tokens)
+    {
+        if( !processtokens_inplace(tgt_kv, mem, tokens) )
+        {
+            LLAMA_LOG_INFO("%s: failed to translate %s\n", __func__, mem->m->what.c_str());
+            throw "Couldn't translate tokens\n";
+        }
+    }
 
     // process_tokens sends a message to all agents
-    int process_tokens( std::string toname, std::string fromname, std::string message, std::vector<llama_token> &tokens )
+    int process_tokens( std::string toname, std::string fromname, std::string message,
+                        std::vector<llama_token> &tokens )
     {
         std::set<System_actor*> messaged;
         System_actor *a;
@@ -3858,93 +4160,145 @@ struct system_kb {
             return 0;
         }
 
-        if( tokens.size() == 0 ) {
-            llama_quick_tokenize( message, tokens );
+        int ts_prev = tokens.size();
+        llama_quick_tokenize( message, tokens );
+        int ts_addit = tokens.size() - ts_prev;
+        int ts_rewind = 0;
+        if( ts_addit == 0 ) {
+            ts_addit=1;
+            ts_rewind=1;
         }
 
-        int batches = floor(tokens.size()/64.0);
-        int n_last_batch = tokens.size() - 64 * batches;
-        LLAMA_LOG_INFO("%s: n_last_batch=%d\n", __func__, n_last_batch);
+        int batches = floor(ts_addit/64.0);
+        int n_last_batch = ts_addit - 64 * batches;
+        LLAMA_LOG_INFO("%s: tokens=%d, additional=%d, rewind=%d\n", __func__, tokens.size(), ts_addit, ts_rewind);
 
         if( toname != "all" ) {
-
-            int i;
             uint8_t tgt_kv;
-            bool found=false;
-
-            for( i=0;i<3;i++ ) {
-                if( kvuser[i]->name == toname && kvuser[i] != NULL ) {
-                    found=true;
-                    tgt_kv = i;
-                    break;
-                }
-            }
-            if( !found )
-                tgt_kv = useactor(toname);
-            usekv(tgt_kv);
-
-            uint16_t seq_start = kv[tgt_kv].seq;
-            processtokens(tgt_kv, fromname, message, tokens);
+            tgt_kv = useactor(toname);
+            processtokens(fromname, message, tokens, false, ts_addit);
             return n_last_batch;
         }
         uint8_t active_kv=0;
 
         for( int tgt=0; tgt<3; tgt++ ) {
-            if( kv_ready[tgt] ) {
-                if( kvuser[tgt]->name == fromname ) {
-                    messaged.insert( kvuser[tgt] );
-                    continue;
-                }
-
-                if( kvuser[tgt]->name == active_actor ) {
-                    active_kv = tgt;
-                }
-                processtokens(tgt, fromname, message, tokens); // fully process
+            if( kv_ready[tgt] && kvuser[tgt] ) {
+                LLAMA_LOG_INFO("Send to %d\n", tgt);
+                seq_start[tgt] -= ts_rewind;
+                useactor(kvuser[tgt]->name);
+                processtokens(fromname, message, tokens, false, ts_addit); // fully process
                 messaged.insert( kvuser[tgt] );
             }
         }
 
         // make sure the context has the active actor as the current kv cache
-        usekv(active_kv);
-
-        if( seq_mark[active_kv] != -1 ) return NULL; // Don't generate memories if we're going to rewind.
+        useactor(active_actor);
+        if( seq_mark[active_kv] != -1 || gen_mark[active_kv] != -1 ) {
+            return n_last_batch; // Don't generate memories if we're going to rewind.
+        }
 
         std::vector<System_actor*>::iterator it; // just say that we're sending it since they're not active yet
-        System_memory *m = (System_memory*)myPool.alloc(sizeof(*m));
-        new (m) System_memory;
-        m->prepare();
-        m->build(fromname, message);
+
+        ragunmap(message); // search for any ragged messages in the past
 
         for( it = actors.begin(); it != actors.end(); it++ ) {
             if( messaged.contains( *it ) ) continue;
 
             a = *it;
             if( a->name == fromname ) continue;
-            a->addhist(m);
+
+            System_memory *m = (System_memory*)myPool.alloc(sizeof(*m));
+            new (m) System_memory;
+            m->prepare();
+            m->build(fromname, message);
+            a->addrecent(m);
         }
+
         return n_last_batch;
     }
 
-    // processtokens sends a message to one agent
-    Kv_mem *processtokens(uint8_t tgt_kv, std::string fromname, std::string message,
-                          std::vector<llama_token> &tokens, bool iskey=false)
+    // processtokens sends a message to one (already-selected) agent
+    Kv_mem *processtokens(std::string fromname, std::string message,
+                          std::vector<llama_token> &tokens, bool iskey=false, uint16_t ts_addit=0)
     {
         size_t i;
         int n_batch = 64;
         uint16_t startpt;
 
-        usekv(tgt_kv);
-
-        if( tokens.size() == 0 ) {
+        if( tokens.size() == 0 && ts_addit == 0 ) {
             llama_quick_tokenize( message, tokens );
+            ts_addit = tokens.size();
         }
 /*
         if( seq_start[tgt_kv] == 0 ) {
             LLAMA_LOG_INFO("Add BOS(%d)\n", tgt_kv);
-            tokens.insert(tokens.begin(), 1);//add BOS for start
+            tokens.insert(tokens.begin()+1, 1);//add BOS for start
         } */
 
+        uint16_t tgt_kv = current_kv;
+
         startpt = seq_start[tgt_kv];
+        for( i=tokens.size()-ts_addit; i < tokens.size(); i += n_batch ) {
+            size_t batch_end = std::min(i + n_batch, tokens.size());
+            std::vector<int> teabatch(tokens.begin() + i, tokens.begin() + batch_end);
+
+            llama_batch batch = llama_batch_init(teabatch.size(), 0, 1);
+            batch.n_tokens = teabatch.size();
+
+            for (int32_t k = 0; k < batch.n_tokens; k++) {
+                batch.token[k] = teabatch[k];
+            }
+
+            current_context->sequential_start = current_context->seq_end = seq_start[tgt_kv] + tokens.size() - ts_addit;
+            int res = llama_decode(current_context, batch);
+            seq_start[tgt_kv] += batch.n_tokens;
+
+            llama_batch_free(batch);
+        }
+
+        if( seq_mark[tgt_kv] != -1 || gen_mark[tgt_kv] != -1 )
+            return NULL; // Don't generate memories if we're going to rewind.
+
+        Kv_mem *mem;
+        System_eidet *eid = (System_eidet*)myPool.alloc(sizeof(*eid));
+        new (eid) System_eidet;
+        eid->prepare();
+
+        // read from current_kv and build eidet
+        eid->build(&(kv[tgt_kv]), fromname, message, startpt, tokens.size());
+        // add to source
+        if( !iskey ) {
+            mem = kvuser[tgt_kv]->addrecent(eid);
+        } else {
+            mem = (Kv_mem*)myPool.alloc(sizeof(Kv_mem));
+            mem->prepare();
+            mem->is_full = true;
+            mem->m = NULL;
+            mem->e = eid;
+            mem->first = startpt;
+            mem->last = startpt+tokens.size()-1;
+        }
+        mem->is_active = true;
+
+        return mem;
+    }
+
+
+    // processtokens sends a message to one agent
+    bool processtokens_inplace(uint8_t tgt_kv, Kv_mem *mem, std::vector<llama_token> &tokens, bool iskey=false)
+    {
+        size_t i;
+        int n_batch = 64;
+        uint16_t startpt;
+
+        LLAMA_LOG_INFO("%s: tgt_kv=%d from=%s n_tokens=%d\nwhat=%s\n", __func__, tgt_kv, mem->m->who.c_str(), mem->m->n_tokens, mem->m->what.c_str());
+        if( tokens.size() == 0 ) {
+            llama_quick_tokenize( mem->m->what, tokens );
+        }
+
+        uint16_t record_ss = seq_start[tgt_kv];
+
+        startpt = seq_start[tgt_kv] = mem->first;
         for( i=0; i < tokens.size(); i += n_batch ) {
             size_t batch_end = std::min(i + n_batch, tokens.size());
             std::vector<int> teabatch(tokens.begin() + i, tokens.begin() + batch_end);
@@ -3956,30 +4310,27 @@ struct system_kb {
                 batch.token[k] = teabatch[k];
             }
 
-            current_context->seq_end = seq_start[tgt_kv];
+            current_context->sequential_start = current_context->seq_end = seq_start[tgt_kv];
             int res = llama_decode(current_context, batch);
             seq_start[tgt_kv] += batch.n_tokens;
 
             llama_batch_free(batch);
         }
 
-        if( seq_mark[tgt_kv] != -1 ) return NULL; // Don't generate memories if we're going to rewind.
+        seq_start[tgt_kv] = record_ss;
 
-        Kv_mem *mem;
         System_eidet *eid = (System_eidet*)myPool.alloc(sizeof(*eid));
         new (eid) System_eidet;
         eid->prepare();
 
         // read from current_kv and build eidet
-        eid->build(&(kv[tgt_kv]), fromname, message, startpt, tokens.size());
+        eid->build(&(kv[tgt_kv]), mem->m->who, mem->m->what, startpt, tokens.size());
         // add to source
-        if( iskey ) {
-            mem = kvuser[tgt_kv]->addmem(eid);
-        } else {
-            mem = kvuser[tgt_kv]->addrecent(eid);
-        }
+        mem->e = eid;
+        mem->is_full = true;
+        mem->is_active = true;
 
-        return mem;
+        return true;
     }
 
     System_actor *getactor( std::string who )
@@ -3993,10 +4344,31 @@ struct system_kb {
             new (a) System_actor;
             a->prepare();
             a->name = who;
-            //if( who != "System" )
             a->loadfile();
+            actors.push_back(a);
             players[who] = a;
             LLAMA_LOG_INFO("%s: actor prepared\n", __func__);
+
+            // link the actor into the ragwordmap
+            // add history to ragwordmap
+            std::string srch;
+            std::vector<Kv_mem*>::iterator it;
+            for( it = a->history.begin(); it != a->history.end(); it++ ) {
+                Kv_mem *memlink = *it;
+                System_memory *m = memlink->m;
+                for( auto srch : m->keywords ) {
+                    std::vector<System_memory *> *x;
+
+                    if( ragwordmap.contains(srch) ) {
+                        x = ragwordmap.at(srch);
+                    } else {
+                        x = (std::vector<System_memory *>*)myPool.alloc(sizeof(std::vector<System_memory *>*));
+                        new (x) std::vector<System_memory *>;
+                        ragwordmap[srch]=x;
+                    }
+                    x->push_back( m );
+                }
+            }
         } else {
             a = players[who];
         }
@@ -4080,13 +4452,21 @@ int llama_poll_vocab( std::unordered_map< std::string, int > &searchspace, float
     return choice;
 }
 
-void llama_mark_rewind( struct llama_context *ctx )
+void llama_mark_rewind( )
 {
     current_kb->mark_rewind();
 }
-void llama_rewind_to_mark( struct llama_context *ctx )
+void llama_rewind_to_mark( )
 {
     current_kb->rewind_to_mark();
+}
+void llama_mark_generation( std::string author )
+{
+    current_kb->mark_generation(author);
+}
+void llama_rewind_generation( std::string message, std::vector<int> &tokens )
+{
+    current_kb->rewind_generation(message, tokens);
 }
 void llama_query_actor_names(std::vector<std::string> &names)
 {
@@ -10268,7 +10648,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     if (batch.token) {
         const int64_t n_tokens = batch.n_tokens;
 
-        LLAMA_LOG_INFO("%s: prepare %d tokens\n", __func__, n_tokens);
+        //LLAMA_LOG_INFO("%s: prepare %d tokens\n", __func__, n_tokens);
         ggml_backend_tensor_set(lctx.inp_tokens, batch.token, 0, n_tokens*ggml_element_size(lctx.inp_tokens));
     }
 
@@ -10423,7 +10803,7 @@ static int llama_decode_internal(
     const int64_t n_embd  = hparams.n_embd;
     const int64_t n_vocab = hparams.n_vocab;
 
-    LLAMA_LOG_INFO("%s: kv_self %p (%p)\n", __func__, &lctx, lctx.sched);
+    //LLAMA_LOG_INFO("%s: kv_self %p (%p)\n", __func__, &lctx, lctx.sched);
     ggml_backend_sched_reset(lctx.sched);
     ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
     //LLAMA_LOG_INFO("%s: kv_self\n", __func__);
@@ -10487,7 +10867,7 @@ static int llama_decode_internal(
     //LLAMA_LOG_INFO("%s: run compute\n", __func__);
     llama_graph_compute(lctx, gf, n_threads);
 
-    //LLAMA_LOG_INFO("%s: compute done\n", __func__);
+    LLAMA_LOG_INFO("%s: compute done\n", __func__);
 
     lctx.seq_end += batch.n_tokens;
 
@@ -10520,11 +10900,11 @@ static int llama_decode_internal(
         GGML_ASSERT(backend_res != nullptr);
 
         if( lctx.record_all > 0 ) {
-            LLAMA_LOG_INFO("%s: record_logits(0..%d)\n", __func__, n_tokens);
+            //LLAMA_LOG_INFO("%s: record_logits(0..%d)\n", __func__, n_tokens);
             logits_out.resize(n_vocab * n_tokens);
             ggml_backend_tensor_get_async(backend_res, res, logits_out.data(), 0, n_vocab*n_tokens*sizeof(float));
         } else {
-            LLAMA_LOG_INFO("%s: record_logits([%d])\n", __func__, n_tokens);
+            //LLAMA_LOG_INFO("%s: record_logits([%d])\n", __func__, n_tokens);
             logits_out.resize(n_vocab);
             ggml_backend_tensor_get_async(backend_res, res, logits_out.data(), (n_vocab*(n_tokens-1))*sizeof(float), n_vocab*sizeof(float));
         }
@@ -15486,15 +15866,7 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
         if( key == "self" ) {
             // create new actor with this self-key
             LLAMA_LOG_INFO("%s: got self key for %s\n", __func__, keyfor.c_str());
-            a = (System_actor*)myPool.alloc(sizeof(*a));
-            new (a) System_actor;
-            a->prepare();
-            a->name = keyfor;
-            LLAMA_LOG_INFO("%s: load files for %s\n", __func__, keyfor.c_str());
-            a->loadfile(); // load in case the actor already exists
-
-            kv->players[keyfor] = a;
-            kv->actors.push_back(a);
+            current_kb->useactor(keyfor);
 
             // set the self-key on that actor
             // just continue llama_set_key(ctx, keyfor, "self", keyval);
@@ -15507,11 +15879,11 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
     a = kv->players[ keyfor ];
     std::vector<llama_token> tokens;
 
-    //! remove any old mem or self key that matches
+    // remove any old mem or self key that matches
     if( key == "self" ) {
-        if( a->self ) {
-            a->self->release(); // tee hee
-            myPool.release( a->self );
+        if( a->mine ) {
+            a->mine->release();
+            myPool.release( a->mine );
         }
     } else if( a->keys.contains(key) ) {
         Kv_mem *target = a->keys[key];
@@ -15531,12 +15903,14 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
 
     // process the tokens
     uint8_t tgt = kv->useactor(a->name);
-    Kv_mem *mem = kv->processtokens(tgt, a->name, keyval, tokens);
+    Kv_mem *mem = kv->processtokens(a->name, keyval, tokens, true, 0);
     if( key == "self" ) {
         a->self = mem->e;
-        myPool.release(mem);
+        a->mine = mem;
+        current_kb->active_actor = a->name; // decide who is responding with logits
     } else {
         a->keys[key] = mem;
+        kv->kvuser[tgt]->mem.push_back(mem);
     }
 
     /*
@@ -15859,7 +16233,7 @@ void llama_kv_cache_shift_fwd( struct llama_context *ctx, int fwd)
     int s = 2 * (ctx->sequential_start + fwd);
     int x = 2 * fwd;
 
-    size_t buffer_sz = 1024*8192;
+    size_t buffer_sz = 2048*ctx->kv_self->size;
 
     void *nd = myPool.alloc( moving_sz );
     void *nd2 = myPool.alloc( empty_sz );

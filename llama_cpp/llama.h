@@ -876,8 +876,10 @@ static bool llama_kv_cache_init(
 extern struct llama_model *current_model;
 extern struct llama_context *current_context;
 
-LLAMA_API void llama_mark_rewind( struct llama_context * );
-LLAMA_API void llama_rewind_to_mark( struct llama_context * );
+LLAMA_API void llama_mark_rewind(  );
+LLAMA_API void llama_rewind_to_mark(  );
+LLAMA_API void llama_mark_generation( std::string );
+LLAMA_API void llama_rewind_generation( std::string, std::vector<int> & );
 LLAMA_API void llama_query_actor_names( std::vector<std::string> & );
 LLAMA_API int llama_process_tokens( std::string toname, std::string fromname, std::string input, std::vector<llama_token> &tokens );
 LLAMA_API std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token);

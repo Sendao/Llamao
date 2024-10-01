@@ -22,6 +22,49 @@ int LLModel::pollAnswer( std::string query, PromptContext &parentCtx, std::vecto
 }
 */
 
+int LLModel::pickNextTalker(  PromptContext &parentCtx, std::string username, std::string lastTalker, std::vector<std::string> actorNames )
+{
+    std::string query = "Who should talk next? (";
+    std::string framing = "It should be ";
+    std::vector<std::string>::iterator it;
+    std::unordered_map<std::string, int> pollData;
+    int iUser=-1, iFirst=-1;
+    std::string firstActorName;
+
+    int i=0;
+    for( it = actorNames.begin(); it != actorNames.end(); it++, i++ ) {
+        if( *it == "System" ) continue;
+        if( *it == username ) {
+            iUser = i;
+        }
+        if( *it == lastTalker ) continue;
+
+        pollData[*it] = i;
+
+        if( iFirst == -1 ) {
+            firstActorName = *it;
+            iFirst = i;
+            pollData["I"] = i;
+            pollData["Me"] = i;
+        } else {
+            query.append("/");
+        }
+
+        query.append(*it);
+    }
+    query.append(")");
+    if( pollData.size() == 0 ) {
+        return iUser;
+    }
+    if( pollData.size() == 3 ) {
+        for( auto &pair : pollData ) {
+            return pair.second;
+        }
+    }
+    //! todo: ask all active actors and compare results
+    return selectAnswer(firstActorName, query, parentCtx, pollData, framing);
+}
+
 int LLModel::selectAnswer( std::string actor, std::string query, PromptContext &parentCtx,
                           std::unordered_map<std::string, int> &answers, std::string framing )
 {
@@ -223,7 +266,9 @@ void LLModel::prompt(const std::string &oldprompt,
     //embd_inp = tokenize(promptCtx, prompt, special);
 
     // decode the user prompt
-    int n_last_batch = decodePrompt(promptCallback, responseCallback, promptCtx, fromname, toname, prompt);
+
+    std::vector<int> tokens;
+    int n_last_batch = decodePrompt(promptCallback, responseCallback, promptCtx, fromname, toname, prompt, tokens);
 
     std::cerr << "decodePrompt complete\n";
 
@@ -231,42 +276,27 @@ void LLModel::prompt(const std::string &oldprompt,
     queryActorNames(actorNames);
     actorNames.push_back(fromname);
 
-    std::string query = "Who should reply?";
-    std::string framing = "It should be ";
-    std::vector<std::string>::iterator it;
-    bool started=false;
-    std::unordered_map<std::string, int> pollData;
-
-    int i=0;
-    for( it = actorNames.begin(); it != actorNames.end(); it++ ) {
-        if( started ) query.append("/");
-        started=true;
-        query.append(*it);
-        pollData[*it] = i;
-        if( *it == toname ) {
-            pollData["I"] = i;
-            pollData["Me"] = i;
-        }
-        i++;
-    }
-    query.append(")");
-
     int iName;
+    std::string newprompt;
+    std::string lastActor=fromname;
     while( true ) {
-        iName = selectAnswer(toname, query, promptCtx, pollData, framing);
+        tokens.clear();
+        iName = pickNextTalker(promptCtx, fromname, lastActor, actorNames);
+        //iName = selectAnswer("System", query, promptCtx, pollData, framing);
         toname = actorNames[iName];
         std::cerr << "pick actor " << toname << "\n";
         if( toname == fromname ) {
             std::cerr << "now it's the user's turn.\n";
             break;
-        } else {
-            std::string msgbuf = "<|im_start|>" + toname + "\n";
-            decodePrompt(promptCallback, responseCallback, promptCtx, toname, "all", msgbuf);
         }
-        markRewind();
-        generateResponse(responseCallback, promptCtx, fromname, toname, n_last_batch);
-        rewindToMark();
-        decodePrompt(promptCallback, responseCallback, promptCtx, toname, "all", prompt);
+        std::string msgbuf = "<|im_start|>" + toname + "\n";
+        markGeneration(toname);
+        tokens.clear();
+        decodePrompt(promptCallback, responseCallback, promptCtx, toname, "all", msgbuf, tokens);
+        newprompt=generateResponse(responseCallback, promptCtx, fromname, toname, n_last_batch, tokens);
+        rewindGeneration(msgbuf + newprompt, tokens);
+        //decodePrompt(promptCallback, responseCallback, promptCtx, toname, "all", newprompt);
+        lastActor=toname;
     };
 }
 
@@ -334,7 +364,8 @@ int LLModel::decodePrompt(std::function<bool(int32_t, int, int, float*, float*)>
                            //std::vector<Token> tokens, //embd_inp,
                            std::string fromname,
                            std::string toname,
-                           std::string prompt) {
+                           std::string prompt,
+                           std::vector<int> &tokens) {
     // save the context size
     promptCtx.n_ctx = contextLength();
 
@@ -391,7 +422,6 @@ int LLModel::decodePrompt(std::function<bool(int32_t, int, int, float*, float*)>
     }
     */
     //std::string empty = "";
-    std::vector<int> tokens;
     return evalTokens(prompt, tokens, fromname, toname);
 }
 int LLModel::decodePrompt2(std::string fromname,
@@ -402,12 +432,12 @@ int LLModel::decodePrompt2(std::string fromname,
 }
 
 
-void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
+std::string LLModel::generateResponse(std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
                                PromptContext &promptCtx, std::string fromname, std::string toname,
-                               int n_last_batch) {
-    std::string cachedResponse;
+                               int n_last_batch, std::vector<int> &tokens) {
     std::string end_literal = "<|im_end|>";
     std::string new_literal = "<|im_start|>";
+    std::string fullResponse;
     int i;
 
     // predict next tokens
@@ -433,7 +463,6 @@ void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, i
     bool ending=false;
     bool gen_new=false;
     bool finished_gen=false;
-    std::vector<int> newTokens;
     std::string activename="System";
     bool sendToAll=false;
 
@@ -441,21 +470,20 @@ void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, i
         sendToAll=true;
     }
 
-    std::cerr << "genResponse(" << n_gen << ": predict " << promptCtx.n_predict << ")\n";
-    for (i = 0; i < n_gen; i++) {
+    std::cerr << "genResponse(" << toname << ")\n";
+    while( true ) {
         //std::cerr << "tokens.size() = " << promptCtx.tokens.size() << "\n";
         feedData( promptCtx.logits, promptCtx.embds );
         auto id = sampleToken(promptCtx, n_last_batch);
-        newTokens.clear();
-        newTokens.push_back(id);
         const std::string str = tokenToString(id);
         std::cerr << "gen: " << str << "(" << id << ")\n";
-        if( (n_last_batch=evalTokens(str, newTokens, activename, toname)) == 0 ) {
+        if( (n_last_batch=evalTokens(str, tokens, activename, toname)) == 0 ) {
             std::cerr << implementation().modelType() << " ERROR: Failed to predict next token\n";
             id = 32000; // end
         }
         promptCtx.tokens.emplace_back( id );
         buf += std::string(str);
+        fullResponse += std::string(str);
 
         auto mlogits = promptCtx.logits;
         auto membd = promptCtx.embds;
@@ -500,9 +528,10 @@ void LLModel::generateResponse(std::function<bool(int32_t, const std::string&, i
             }
         }
     }
+
+    return fullResponse;
 }
 std::string LLModel::generateResponse2(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch) {
-    std::string cachedResponse;
     std::string end_literal = "<|im_end|>";
     int i;
     std::string buf = "";
@@ -546,7 +575,6 @@ std::string LLModel::generateResponse2(PromptContext &promptCtx, std::string fro
 int LLModel::generateResponse3(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch,
                                 std::unordered_map< std::string, int > &answers)
 {
-    std::string cachedResponse;
     std::string end_literal = "<|im_end|>";
     int i;
 

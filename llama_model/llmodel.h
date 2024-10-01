@@ -147,6 +147,8 @@ public:
     virtual int32_t threadCount() const { return 1; }
     virtual void markRewind(void) { return; }
     virtual void rewindToMark(void) { return; }
+    virtual void markGeneration(std::string) { return; }
+    virtual void rewindGeneration(std::string, std::vector<int> &) { return; }
     virtual void queryActorNames(std::vector<std::string> &) { return; }
     virtual int pollVocab( std::unordered_map< std::string, int > &searchspace, float *logits ) { return -1; }
 
@@ -210,6 +212,8 @@ protected:
         return true;
     }
 
+    int pickNextTalker(  PromptContext &parentCtx, std::string username, std::string lastTalker,
+                              std::vector<std::string> actorNames );
     int selectAnswer( std::string actor, std::string query, PromptContext &parentCtx,
                               std::unordered_map<std::string, int> &answers, std::string framing );
     std::string queryActor( std::string actor, std::string query, PromptContext &parentCtx );
@@ -218,12 +222,14 @@ protected:
                       PromptContext &promptCtx,
 /*                      std::vector<Token> embd_inp,*/
                       std::string fromname, std::string toname,
-                      std::string prompt);
+                      std::string prompt,
+                      std::vector<int> &tokens);
     int decodePrompt2(std::string fromname,
                                std::string toname,
                                std::string prompt);
-    void generateResponse(std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
-                          PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch);
+    std::string generateResponse(std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
+                          PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch,
+                          std::vector<int> &tokens);
     std::string generateResponse2(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch);
     int generateResponse3(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch,
                                    std::unordered_map< std::string, int > &answers);
