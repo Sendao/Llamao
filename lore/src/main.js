@@ -1537,7 +1537,7 @@ async function windowMessage(winid, cmd, ...params) {
     }
 
     let msg = params[1];
-    if( msg == lastmsg && lastmsg != "" && cmd != "busy" ) {
+    if( msg !== 0 && typeof msg != 'undefined' && msg.length > 10 && msg == lastmsg && lastmsg != "" && cmd != "busy" ) {
         console.log("Repeated message [" + params[1] + "]");
         Error.stackTraceLimit = 100;
         console.trace();
@@ -1546,6 +1546,11 @@ async function windowMessage(winid, cmd, ...params) {
         lastmsg = msg;
 
     await windows[winid].webContents.send(cmd, ...params);
+    if( typeof msg == 'string' ) {
+        if( msg.indexOf("<|im_end|>") >= 0 ) {
+            await windowMessage(winid, cmd, params[0], 0);
+        }
+    }
 }
 app.whenReady().then(acquireDesktop);
 

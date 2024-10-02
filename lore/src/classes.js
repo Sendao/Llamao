@@ -2541,7 +2541,7 @@ class ModelState
 
     async safeComplete(from, msg, opts)
     {
-        if( this.context.shi.currently_busy && !opts.override ) {
+        if( this.context.shi.currently_busy && ( typeof opts == 'undefined' || !opts.override ) ) {
             this.safeq.push([from,msg,opts]);
             return "";
         }
