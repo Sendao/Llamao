@@ -623,7 +623,12 @@ How do people interact with each other?
 
     saveAll()
     {
-        this.actors[0].modelstate.safeComplete("", "/save");
+        this.actors[0].modelstate.safeComplete("", "/save", {
+                fincb: async function(result) {
+                    await this.msgWindow( this.winid, "System", "Saved all.");
+                    await this.msgWindow( this.winid, "System", 0 );
+                }.bind(this)
+            } );
     }
 
     summon(mode)
@@ -806,7 +811,7 @@ How do people interact with each other?
             }
         }
 
-        var i, lines;
+        var i, lines=[];
         if( name in this.usedthemes ) {
             let th = randomInt(0,this.usedthemes[name].length-1);
             if( this.usedthemes[name][th] in this.themes ) {
@@ -858,8 +863,11 @@ How do people interact with each other?
         }
 
         var buf;
+        console.log("guidance: use line " + i + "/" + lines.length);
         if( i >= lines.length ) {
-            buf = this.guidance[randomInt(0,this.guidance.length-1)];
+            i = randomInt(0,this.guidance.length-1);
+            console.log("guidance overflow, use guidance " + i + "/" + this.guidance.length);
+            buf = this.guidance[i];
         } else {
             buf = lines[i];
         }
@@ -2846,16 +2854,51 @@ class ModelState
             //await this.setInfoLevel(1);
         }
         console.log("Running query.");
+        ctx.buffer = "";
         let response = await this.safeComplete(from, prompt, { tokencb: async function(ctx, use_coins, token) {
             //console.log("qry: ->" + token);
+            if( ctx.buffer != "" ) 
+                token = ctx.buffer + token;
+            if( "<|im_end|>".startsWith(token) ) {
+                ctx.buffer = token;
+                return;
+            } else {
+                var buf = "<|im_end|>";
+                var i,j,k,found=false;
+                for( i=token.length-1; i>=0; i-- ) {
+                    if( buf[0] == token[i] ) {
+                        for( k = i+1,j=1; k<token.length; k++,j++ ) {
+                            if( buf[j] != token[k] ) {
+                                break;
+                            }
+                        }
+                        if( k >= token.length ) {
+                            found=true;
+                            break;
+                        }
+                    }
+                }
+                if( !found )
+                    ctx.buffer = "";
+                else {
+                    ctx.buffer = token.substring(i);
+                    token = token.substring(0,i);
+                    return;
+                }
+            }
+            let endpos = token.indexOf("<|im_end|>");
+            if( endpos >= 0 ) {
+                token = token.substring(0,endpos) + token.substring(endpos+10);
+                if( token == "" ) return;                
+            }
             if( use_coins )
                 ctx.shi.Cost(0.02);
             await ctx.send(token, cbid);
         }.bind(this, ctx, use_coins), fincb: async function(ctx, cbid, from, result) {
-            if( !this.continuing ) {
-                await ctx.send(0, cbid);
-                ctx.shi.Cost(0);
-            }
+            //if( !this.continuing ) {
+            await ctx.send(0, cbid);
+            ctx.shi.Cost(0);
+            //}
             console.log("query fin:", from, result);
             if( this.stopping ) this.stopping = false;
         }.bind(this, ctx, cbid, from) });

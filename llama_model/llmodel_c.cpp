@@ -279,8 +279,8 @@ struct llmodel_gpu_device *llmodel_available_gpu_devices(size_t memoryRequired, 
         cdev.index    = dev.index;
         cdev.type     = dev.type;
         cdev.heapSize = dev.heapSize;
-        cdev.name     = strdup(dev.name.c_str());
-        cdev.vendor   = strdup(dev.vendor.c_str());
+        cdev.name     = _strdup(dev.name.c_str());
+        cdev.vendor   = _strdup(dev.vendor.c_str());
     }
 
     return c_devices.get();

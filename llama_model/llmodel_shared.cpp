@@ -261,10 +261,6 @@ void LLModel::prompt(const std::string &oldprompt,
     }
 
     //std::cerr << "LLModel reading prompt " << prompt << "\n";
-    // tokenize the user prompt
-    //std::vector<Token> embd_inp;
-    //embd_inp = tokenize(promptCtx, prompt, special);
-
     // decode the user prompt
 
     std::vector<int> tokens;
@@ -280,6 +276,7 @@ void LLModel::prompt(const std::string &oldprompt,
     std::string newprompt;
     std::string lastActor=fromname;
     while( true ) {
+        std::cerr << "pick actor...\n";
         tokens.clear();
         iName = pickNextTalker(promptCtx, fromname, lastActor, actorNames);
         //iName = selectAnswer("System", query, promptCtx, pollData, framing);
@@ -293,70 +290,14 @@ void LLModel::prompt(const std::string &oldprompt,
         markGeneration(toname);
         tokens.clear();
         decodePrompt(promptCallback, responseCallback, promptCtx, toname, "all", msgbuf, tokens);
-        newprompt=generateResponse(responseCallback, promptCtx, fromname, toname, n_last_batch, tokens);
+        // here we are generating the response so the toname is the same as the fromname.
+        newprompt=generateResponse(responseCallback, promptCtx, toname, toname, n_last_batch, tokens);
+        // rewind_generation will proceed with sending the message to 'all'.
         rewindGeneration(msgbuf + newprompt, tokens);
-        //decodePrompt(promptCallback, responseCallback, promptCtx, toname, "all", newprompt);
         lastActor=toname;
+        std::cerr << "done [one line]\n";
     };
 }
-
-/*
-void LLModel::idle_prompt(std::function<bool(int32_t, int, int, float*, float*)> promptCallback,
-                           std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
-                          PromptContext &promptCtx)
-{
-    if( promptCtx.continuing ) {
-        generateResponse(responseCallback, promptCtx);
-        if( promptCtx.n_predict == 0 ) {
-            setKey("");
-        }
-        return;
-    }
-    const char *keyptr, *fmtptr;
-    int max_gen;
-    const char *req = llamaIdle(promptCtx, &keyptr, &fmtptr, &max_gen);
-    if( !req ) {
-        return;
-    }
-    std::cerr << __func__ << ": idle function " << req << " " << keyptr << " " << max_gen << " " << fmtptr << "\n";
-    std::string *request = new std::string(req);
-    if( request->length() == 0 ) return;
-
-    std::string *keycopy = new std::string(keyptr);
-    //std::string *fmtcopy = new std::string(fmtptr);
-
-    std::vector<Token> embd_inp = tokenize(promptCtx, *request, true);
-
-    int i, len=embd_inp.size();
-    float *zero=NULL;
-    std::string x = "idle prompt: ";
-    x.append(keycopy->c_str());
-    //TODO: Conversion to std::string can be avoided here...
-    if (!responseCallback(0, x.c_str(), 0, 0, zero, zero))
-        return;
-    for( i=0; i<len; i++ ) {
-        //TODO: Conversion to std::string can be avoided here...
-        if (!responseCallback(embd_inp[i], std::string(tokenToString(embd_inp[i])), 0, 0, zero, zero))
-            return;
-    }
-
-    decodePrompt(promptCallback, responseCallback, promptCtx, embd_inp);
-
-    promptCtx.n_predict = max_gen;
-    promptCtx.continuing = true;
-    promptCtx.n_past = reserveCache(promptCtx, max_gen+24); // overrides n_past
-    setKey(keycopy->c_str());
-    generateResponse(responseCallback, promptCtx);
-
-    if( promptCtx.n_predict == 0 ) {
-        setKey("");
-    }
-
-    delete(keycopy);
-    //delete(fmtcopy);
-    delete(request);
-}
-    */
 
 int LLModel::decodePrompt(std::function<bool(int32_t, int, int, float*, float*)> promptCallback,
                            std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
@@ -368,60 +309,6 @@ int LLModel::decodePrompt(std::function<bool(int32_t, int, int, float*, float*)>
                            std::vector<int> &tokens) {
     // save the context size
     promptCtx.n_ctx = contextLength();
-
-    /*
-    if ((int) embd_inp.size() > promptCtx.n_ctx - 4) {
-        responseCallback(-1, "ERROR: The prompt size exceeds the context window size and cannot be processed.", 0, 0, NULL, NULL);
-        std::cerr << implementation().modelType() << " ERROR: The prompt is " << embd_inp.size() <<
-            " tokens and the context window is " << promptCtx.n_ctx << "!\n";
-        return;
-    }
-*/
-
-
-    /*
-    promptCtx.n_past = reserveCache(promptCtx, embd_inp.size()+1); // overrides n_past
-
-    if (size_t(promptCtx.n_past) < promptCtx.tokens.size()) {
-        std::cerr << "Resize tokens " << promptCtx.tokens.size() << " to " << promptCtx.n_past << "\n";
-        promptCtx.tokens.resize(promptCtx.n_past);
-    }
-    */
-
-    //std::cerr << "LLModel processing prompt (" << embd_inp.size() << ")\n";
-
-    /*
-    promptCtx.n_predict = std::min(promptCtx.n_predict, promptCtx.n_ctx - (int) embd_inp.size());
-    promptCtx.n_batch = std::min(promptCtx.n_batch, LLMODEL_MAX_PROMPT_BATCH);
-
-    // process the prompt in batches
-    size_t i = 0;
-    std::string inputStr;
-    while (i < embd_inp.size()) {
-        size_t batch_end = std::min(i + promptCtx.n_batch, embd_inp.size());
-        std::vector<Token> batch(embd_inp.begin() + i, embd_inp.begin() + batch_end);
-
-        inputStr = "";
-        for( int j=0; j<batch.size(); j++ ) {
-            inputStr.append( tokenToString(batch[j]) );
-        }
-
-        if (!evalTokens(inputStr, batch)) {
-            std::cerr << implementation().modelType() << " ERROR: Failed to process prompt\n";
-            return;
-        }
-
-        size_t tokens = batch_end - i;
-        for (size_t t = 0; t < tokens; ++t) {
-            promptCtx.tokens.push_back(batch.at(t));
-            if (!promptCallback(batch.at(t), 0, 0, NULL, NULL))
-                return;
-        }
-        i = batch_end;
-        promptCtx.n_past += tokens;
-    }
-    */
-    //std::string empty = "";
     return evalTokens(prompt, tokens, fromname, toname);
 }
 int LLModel::decodePrompt2(std::string fromname,
@@ -450,10 +337,7 @@ std::string LLModel::generateResponse(std::function<bool(int32_t, const std::str
     std::string buf = "";
     std::string sstr;
 
-    std::vector<int> tokenbuf;
-    std::vector<std::string> strbuf;
-    std::vector<std::vector<float>> logitbuf;
-    std::vector<std::vector<float>> embdbuf;
+    bool found;
 
     std::vector<int>::iterator it;
     std::vector<std::string>::iterator sit;
@@ -463,14 +347,15 @@ std::string LLModel::generateResponse(std::function<bool(int32_t, const std::str
     bool ending=false;
     bool gen_new=false;
     bool finished_gen=false;
-    std::string activename="System";
+    std::string activename=fromname;
     bool sendToAll=false;
+    const char *p1, *p2;
 
     if( toname == "all" ) {
         sendToAll=true;
     }
 
-    std::cerr << "genResponse(" << toname << ")\n";
+    std::cerr << "genResponse(" << fromname << ")\n";
     while( true ) {
         //std::cerr << "tokens.size() = " << promptCtx.tokens.size() << "\n";
         feedData( promptCtx.logits, promptCtx.embds );
@@ -488,45 +373,29 @@ std::string LLModel::generateResponse(std::function<bool(int32_t, const std::str
         auto mlogits = promptCtx.logits;
         auto membd = promptCtx.embds;
 
+        found = false;
+        for( p1 = end_literal.c_str(), p2 = buf.c_str(); *p1 && *p2; p2++ ) {
+            if( *p1 == *p2 ) {
+                p1++;
+                found=true;
+            } else {
+                found=false;
+            }
+        }
+        if( found ) {
+            if( buf.ends_with(end_literal) )
+                break;
+            continue;
+        }
+
         // share with cb
-        if (!responseCallback(id, std::string(str), mlogits.size(), membd.size(), mlogits.data(), membd.data())) {
+        if (!responseCallback(id, std::string(buf), mlogits.size(), membd.size(), mlogits.data(), membd.data())) {
             promptCtx.n_predict = 0;
             i = 0;
             std::cerr << "Generation aborted by responseCallback.\n";
             break;
         }
-
-        if( generatedTokens > 0 && buf.ends_with(end_literal) ) {
-            break;
-        }
-        if( !end_literal.starts_with(buf) ) {
-            const char *p1, *p2;
-            int chars=0;
-            bool found=false;
-            for( p1 = end_literal.c_str(), p2 = buf.c_str(); *p1 && *p2; p2++ ) {
-                if( *p2 == *p1 ) {
-                    found=true;
-                    p1++;
-                    chars++;
-                } else if( found ) {
-                    found=false;
-                    chars=0;
-                    p1 = end_literal.c_str();
-                }
-            }
-            if( !found ) {
-                generatedTokens++;
-                buf="";
-            } else {
-                char buf1[24], *p3;
-                for( p3=buf1, p2 = end_literal.c_str(); *p2 && chars>0; p2++, p3++, chars-- ) {
-                    *p3 = *p2;
-                }
-                *p3 = '\0';
-                buf = buf1;
-                std::cerr << "Reduce buffer to '" << buf1 << "'\n";
-            }
-        }
+        buf = "";
     }
 
     return fullResponse;

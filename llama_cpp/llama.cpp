@@ -121,6 +121,10 @@ static void llama_log_callback_default(ggml_log_level level, const char * text, 
 #define LLAMA_LOG_WARN(...)  llama_log_internal(GGML_LOG_LEVEL_WARN , __VA_ARGS__)
 #define LLAMA_LOG_ERROR(...) llama_log_internal(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
 
+void LLAMA_TRACK(std::string tag, size_t value);
+void llama_enable_tracker(std::string tag);
+void llama_disable_tracker(std::string tag);
+
 //
 // helpers
 //
@@ -163,6 +167,7 @@ static size_t utf8_len(char src) {
 }
 
 static const int kv_context = 1;
+std::string quick_ts();
 
 static void replace_all(std::string & s, const std::string & search, const std::string & replace) {
     std::string result;
@@ -1023,224 +1028,953 @@ typedef struct llama_mem Llama_mem;
 struct llama_mem {
     void *addr=NULL;
     size_t sz=0;
+    uint16_t *refc;
+    void *ref;
+
+    llama_mem()
+    {
+        addr=ref=NULL;
+        refc=NULL;
+    }
+
+    llama_mem( void *ptr )
+    {
+        addr = ptr;
+        sz = 0;
+        refc = (uint16_t*)malloc(sizeof(uint16_t));
+        *refc = 1;
+        ref = ptr;
+    }
+
+    llama_mem( Llama_mem *copy )
+    {
+        addr = copy->addr;
+        sz = copy->sz;
+        refc = copy->refc;
+        *refc = *refc + 1;
+        ref = copy->ref;
+    }
+
+    ~llama_mem()
+    {
+        if( !refc ) return;
+
+        *refc = *refc - 1;
+        if( *refc == 0 ) {
+            free(ref);
+            free(refc);
+        }
+    }
 };
 
-typedef struct llama_pool Llama_pool;
-typedef struct llama_pool _Pool;
+typedef struct senmemory_pool Llama_pool;
+typedef struct senmemory_pool _Pool;
+
+typedef struct Sp_searchable sp_searchable;
+struct Sp_searchable {
+    size_t inds[2];
+    uint16_t refs[2];
+    void *data;
+
+    Sp_searchable(void *ptr)
+    {
+        data = ptr;
+        inds[0] = 0;
+        inds[1] = 0;
+        refs[0] = 0;
+        refs[1] = 0;
+    }
+};
+
+typedef struct Sp_linked sp_linked;
+typedef void voidcb(void *ptr);
+typedef void voidcb2(void *ptr, uint16_t count);
+
+struct Sp_linked {
+    sp_linked *next=NULL;
+    sp_linked *prev=NULL;
+    void *data=NULL;
+    uint16_t count=0;
+
+    Sp_linked() {
+        next=prev=NULL;
+        data=NULL;
+        count=0;
+    }
+    ~Sp_linked() {
+        delete next;
+    }
+    void forall(voidcb2 *func)
+    {
+        sp_linked *i;
+        for( i = this; i; i = i->next ) {
+            func(i->data, count);
+        }
+    }
+
+    sp_linked *insert(void *ptr)
+    {
+        if( !data ) {
+            data=ptr;
+            return this;
+        }
+        sp_linked *i = new sp_linked();
+        i->data = ptr;
+
+        i->next = next;
+        i->prev = this;
+
+        this->next = i;
+        if( next )
+            next->prev = i;
+        return i;
+    }
+};
+void delete_splinked(void *ptr)
+{
+    sp_linked *spl = (sp_linked*)ptr;
+    delete spl;
+}
+
+typedef struct Sp_linkedarray sp_linkedarray;
+typedef sp_linkedarray sp_la;
+void sp_la_free( void *ptr, uint16_t count )
+{
+    if( !ptr ) return;
+    free(ptr);
+}
+uint8_t sp_la_searchby;
+void sp_la_shifter( void *ptr, uint16_t count )
+{
+    void **buf = (void**)ptr;
+    uint16_t i;
+    sp_searchable *sb;
+
+    for( i=0; i<count; i++ ) {
+        sb = (sp_searchable*)buf[i];
+        sb->inds[ sp_la_searchby ]--;
+    }
+}
+
+struct Sp_linkedarray {
+    sp_linked *head;
+    sp_linked *tail;
+    uint16_t asize=512;
+
+    Sp_linkedarray(uint16_t as) {
+        asize=as;
+        head=tail=new sp_linked();
+        head->count = 0;
+        head->data = malloc(asize*sizeof(void*));
+        memset( head->data, 0, sizeof(void*)*asize );
+    }
+    ~Sp_linkedarray() { //! make sure to destroy the contents first as this only releases the mass pointers.
+        head->forall(sp_la_free);
+        delete head;
+    }
 
 
-struct llama_pool {
-    std::vector<Llama_mem *> used;
-    std::vector<Llama_mem *> loose_contig; // for merging with neighbors
-    std::vector<Llama_mem *> loose_bysize; // for allocation
+    sp_linked *get(uint16_t tgtlist)
+    {
+        sp_linked *i;
+        uint16_t listno;
 
-    typedef std::vector<Llama_mem *>::iterator memiter;
+        listno=0;
+        //LLAMA_LOG_INFO("Get list %u\n", tgtlist);
+        for( i = head; i; i = i->next, listno++ ) {
+            if( listno == tgtlist ) {
+                return i;
+            }
+            if( i == tail ) {
+                listno++;
+                sp_linked *item = i->insert(malloc(asize*sizeof(void*)));
+                tail = item;
+                memset( item->data, 0, sizeof(void*)*asize );
+                return item;
+            }
+        }
+        PrintStackTrace();
+        throw "Unreachable code area 2\n";
+    }
+    sp_linked *get(size_t addr, uint16_t &remainder, uint16_t &listno, uint8_t searchby)
+    {
+        sp_linked *i, *j;
+        void **buf;
+        uint16_t n=0;
+        size_t req=addr;
+
+        if( addr == 0 ) {
+            remainder=listno=0;
+            return head;
+        }
+
+        listno=0;//! todo: remove empty lists
+        for( i = head; i; i = i->next, listno++ ) {
+            while( i->count == 0 ) {
+                // remove empty list
+                j = i->next;
+                if( i->prev ) {
+                    i->prev->next = j;
+                } else {
+                    head = j;
+                }
+                if( j ) {
+                    j->prev = i->prev;
+                    sp_la_searchby=searchby;
+                    j->forall( sp_la_shifter );
+                    i->next = NULL;
+                    delete i;
+                    i = j;
+                } else {
+                    tail = j = i->prev;
+                    delete i;
+                    addr += j->count;
+                    i = j;
+                    listno--;
+                    break;
+                }
+            }
+
+            if( addr < i->count ) {
+                remainder=addr;
+                //LLAMA_LOG_INFO("%s: get(%zu) found %u after %u lists.\n", __func__, req, remainder, listno);
+                return i;
+            }
+            addr -= i->count;
+            if( !i->next ) {
+                if( addr == 0 && i->count < asize ) {
+                    remainder=i->count;
+                    LLAMA_LOG_INFO("warning %s: get(%zu) 4 found %u after %u lists.\n", __func__, req, remainder, listno);
+                    return i;
+                }
+                listno++;
+                sp_linked *item = i->insert(malloc(asize*sizeof(void*)));
+                if( item->next == NULL ) {
+                    tail = item;
+                }
+                memset( item->data, 0, sizeof(void*)*asize );
+                remainder = addr;
+                LLAMA_LOG_INFO("warning %s: get(%zu) 2 found %u after %u lists.\n", __func__, req, remainder, listno);
+                return item;
+            }
+        }
+        PrintStackTrace();
+        throw "Unreachable code area 1\n";
+    }
+
+    void forall( voidcb *func )
+    {
+        uint16_t x;
+        Sp_linked *i;
+        void **buf;
+
+        for( i = head; i; i = i->next ) {
+            buf = (void**)i->data;
+            for( x = 0; x < asize; x++ ) {
+                if( buf[x] == NULL ) continue;
+                func(buf[x]);
+            }
+        }
+    }
+};
+
+template<typename T, typename S, typename Q>
+class Sp_searchnest {
+public:
+    uint16_t units;
+    uint16_t dataptr[2];
+    size_t count;
+    sp_la *data[2];
+
+    Sp_searchnest(uint16_t u, uint16_t d1, uint16_t d2) {
+        units = u;
+        dataptr[0] = d1;
+        dataptr[1] = d2;
+        data[0] = new sp_la(units);
+        data[1] = new sp_la(units);
+        count = 0;
+    }
+    ~Sp_searchnest() {
+        if( data[0] ) {
+            delete data[0];
+            delete data[1];
+            data[0]=NULL;
+        }
+    }
+    void shift_ind_r( sp_linked *ptr, uint16_t searchby )
+    {
+        // shift ind right by 1 for all after ptr
+        sp_searchable *sb;
+        void **buf;
+        uint16_t o;
+        for( ; ptr; ptr = ptr->next ) {
+            buf = (void**)ptr->data;
+            for( o=0; o<ptr->count; o++ ) {
+                sb = (sp_searchable*)buf[o];
+                if( sb )
+                    sb->inds[searchby]++;
+            }
+        }
+    }
+    void shift_pointers_r( sp_linked *ptr, uint16_t offset, uint8_t searchby )
+    {
+        uint16_t i;
+        sp_searchable *sb;
+        void **buf = (void**)ptr->data;
+        //LLAMA_LOG_INFO("spr(%u) %u/%u\n", searchby, offset, ptr->count);
+        if( ptr->count == units ) { // we have to go to the next list; this one is full
+            Sp_linked *next = ptr->next;
+            void **b2;
+            uint16_t j=units;
+
+            if( next==NULL || next->count == units ) {
+                // create a new storage area
+                //LLAMA_LOG_INFO("spr: insert new next (%p, %zu)\n", next, next ? next->count : 0);
+                sp_linked *item = ptr->insert(malloc(units*sizeof(void*)));
+                memset( item->data, 0, sizeof(void*)*units );
+                if( next ) {
+                    shift_ind_r(next, searchby);
+                } else {
+                    data[searchby]->tail = item;
+                }
+                item->count = 1;
+                b2 = (void**)item->data;
+            } else {
+                b2 = (void**)next->data;
+                next->count++;
+                for( j = next->count-1; j>0; j-- ) {
+                    b2[j] = b2[j-1];
+                    sb = (sp_searchable*)b2[j];
+                    if( sb )
+                        sb->refs[searchby]=j;
+                }
+            }
+            b2[0] = buf[units-1];
+            sb = (sp_searchable*)b2[0];
+            if( sb ) {
+                sb->inds[searchby]++;
+                sb->refs[searchby]=0;
+            }
+            //LLAMA_LOG_INFO("overflow complete\n");
+        } else {
+            ptr->count++;
+        }
+
+        for( i = ptr->count-1; i>offset; i-- ) {
+            buf[i] = buf[i-1];
+            sb = (sp_searchable*)buf[i];
+            if( sb )
+                sb->refs[searchby]=i;
+        }
+
+        buf[offset]=NULL;
+        //LLAMA_LOG_INFO("%s: done\n", __func__);
+    }
+    void shift_pointers_l( sp_linked *ptr, uint16_t offset, uint8_t searchby )
+    {
+        uint16_t i;
+        void **buf = (void**)ptr->data;
+        sp_searchable *sb;
+        //LLAMA_LOG_INFO("spl %u/%u %u\n", offset, ptr->count, searchby);
+        for( i=offset+1; i<ptr->count; i++ ) {
+            buf[i-1] = buf[i];
+            sb = (sp_searchable*)buf[i];
+            if( sb )
+                sb->refs[searchby]=i-1;
+        }
+        ptr->count--;
+    }
+    sp_searchable *bs( uint8_t searchby, T* ref, size_t &M, uint16_t &miditem, uint16_t &listno )
+    {
+        S *valS = (S*)(char**)( ((uint8_t*)ref + dataptr[0] ) );
+        Q *valQ = (Q*)(char**)( ((uint8_t*)ref + dataptr[1] ) );
+        //LLAMA_LOG_INFO("search: %zu %u for %p/%p\n", count, dataptr[searchby], *valS, *valQ);
+        sp_linked *mid;
+        size_t L,R,Ml,Mr;
+        void **buf;
+        S *sptr;
+        Q *qptr;
+        sp_searchable * midref;
+
+        LLAMA_TRACK("sp_search", 0);
+
+        L=M=0;
+        R=count>0?count-1:0;
+        miditem=0;
+        listno=0;
+        while(L<R) {
+            M=L+floor((float)(R-L)/2.0);
+            mid = data[searchby]->get(M,miditem,listno,searchby);
+            LLAMA_TRACK("sp_search", 1);
+            buf = (void**)mid->data;
+            midref = (sp_searchable*)( buf[miditem] );
+            Ml=Mr=M;
+            LLAMA_TRACK("sp_search", 2);
+            if( midref == NULL ) {
+                LLAMA_LOG_INFO("%s error: midref==null M=%zu L=%zu R=%zu\n", __func__, M, L, R);
+                throw "error\n";
+            }
+            if( searchby == 0 )
+                sptr = (S*)(char**)( (uint8_t*)midref->data + dataptr[0] );
+            else
+                qptr = (Q*)(char**)( (uint8_t*)midref->data + dataptr[1] );
+
+            LLAMA_TRACK("sp_search", 3);
+            if( searchby == 0 ) {
+                //LLAMA_LOG_INFO("%s: compare s %p(%zu) vs %p\n", __func__, (void*)*sptr, M, (void*)*valS);
+                if( *sptr < *valS ) {
+                    L = M = M+1;
+                } else if( *sptr == *valS ) {
+                    L = M;
+                    break;
+                } else {
+                    R = M = M>0?M - 1:0;
+                }
+            } else {
+                //LLAMA_LOG_INFO("%s: compare q %p vs %p\n", __func__, (void*)*qptr, (void*)*valQ);
+                if( *qptr < *valQ ) {
+                    L = M;
+                } else if( *qptr == *valQ ) {
+                    L = M;
+                    break;
+                } else {
+                    R = M = M>0?M - 1:0;
+                }
+            }
+            LLAMA_TRACK("sp_search", 4);
+        }
+        if( M == 0 ) {
+            mid = data[searchby]->head;
+            miditem=0;
+            listno=0;
+            LLAMA_TRACK("sp_search", 5);
+        } else if( M == count ) {
+            miditem++;
+            if( miditem == units ) {
+                miditem=0;
+                listno++;
+            }
+            LLAMA_TRACK("sp_search", 6);
+            return NULL;
+        } else {
+            mid = data[searchby]->get( M, miditem, listno, searchby );
+        }
+        buf = (void**)mid->data;
+        midref = (sp_searchable*)( buf[miditem] );
+        //LLAMA_LOG_INFO("%s: M=%zu, miditem=%u, listno=%u\n", __func__, M, miditem, listno);
+        LLAMA_TRACK("sp_search", 9);
+        return midref;
+    }
+    /*
+    sp_searchable *bslb( uint8_t searchby, T* ref, size_t &M, uint16_t &miditem, uint16_t &listno )
+    {
+        S *valS = (S*)(char**)( ((uint8_t*)ref + dataptr[0] ) );
+        Q *valQ = (Q*)(char**)( ((uint8_t*)ref + dataptr[1] ) );
+        //LLAMA_LOG_INFO("search: %zu %u for %p/%p\n", count, dataptr[searchby], *valS, *valQ);
+        sp_linked *mid;
+        size_t L,R,Ml,Mr;
+        void **buf;
+        S *sptr;
+        Q *qptr;
+        sp_searchable * midref;
+
+        L=M=0;
+        R=count>0?count-1:0;
+        miditem=0;
+        listno=0;
+        while(L<R) {
+            M=L+ceil((float)(R-L)/2.0);
+            mid = data[searchby]->get(M,miditem,listno,searchby);
+            buf = (void**)mid->data;
+            midref = (sp_searchable*)( buf[miditem] );
+            Ml=Mr=M;
+            if( midref == NULL ) {
+                LLAMA_LOG_INFO("%s error: midref==null M=%zu L=%zu R=%zu\n", __func__, M, L, R);
+                throw "error\n";
+            }
+            if( searchby == 0 )
+                sptr = (S*)(char**)( (uint8_t*)midref->data + dataptr[0] );
+            else
+                qptr = (Q*)(char**)( (uint8_t*)midref->data + dataptr[1] );
+
+            if( searchby == 0 ) {
+                //LLAMA_LOG_INFO("%s: compare s %p(%zu) vs %p\n", __func__, (void*)*sptr, M, (void*)*valS);
+                if( *sptr < *valS ) {
+                    L = M;
+                } else if( *sptr == *valS ) {
+                    L = M;
+                    break;
+                } else {
+                    R = M = M>0?M - 1:0;
+                }
+            } else {
+                //LLAMA_LOG_INFO("%s: compare q %p vs %p\n", __func__, (void*)*qptr, (void*)*valQ);
+                if( *qptr < *valQ ) {
+                    L = M;
+                } else if( *qptr == *valQ ) {
+                    L = M;
+                    break;
+                } else {
+                    R = M = M>0?M - 1:0;
+                }
+            }
+        }
+        if( M == 0 ) {
+            mid = data[searchby]->head;
+            miditem=0;
+            listno=0;
+        } else if( M == count ) {
+            miditem++;
+            if( miditem == units ) {
+                miditem=0;
+                listno++;
+            }
+            return NULL;
+        } else {
+            mid = data[searchby]->get( M, miditem, listno, searchby );
+        }
+        buf = (void**)mid->data;
+        midref = (sp_searchable*)( buf[miditem] );
+        //LLAMA_LOG_INFO("%s: M=%zu, miditem=%u, listno=%u\n", __func__, M, miditem, listno);
+        return midref;
+    }
+    */
+    sp_searchable *bsub( uint8_t searchby, T* ref, size_t &M, uint16_t &miditem, uint16_t &listno )
+    {
+        S *valS = (S*)(char**)( ((uint8_t*)ref + dataptr[0] ) );
+        Q *valQ = (Q*)(char**)( ((uint8_t*)ref + dataptr[1] ) );
+        //LLAMA_LOG_INFO("search: %zu %u for %p/%p\n", count, dataptr[searchby], *valS, *valQ);
+        sp_linked *mid;
+        size_t L,R;
+        void **buf;
+        S *sptr;
+        Q *qptr;
+        sp_searchable * midref;
+        LLAMA_TRACK("sp_search_ub", 0);
+
+        L=M=0;
+        R=count>0?count-1:0;
+        miditem=0;
+        listno=0;
+        while(L<R) {
+            M=L+floor((float)(R-L)/2.0);
+            mid = data[searchby]->get(M,miditem,listno,searchby);
+            buf = (void**)mid->data;
+            midref = (sp_searchable*)( buf[miditem] );
+            if( midref == NULL ) {
+                LLAMA_LOG_INFO("%s error: midref==null M=%zu L=%zu R=%zu\n", __func__, M, L, R);
+                throw "error\n";
+            }
+            if( searchby == 0 )
+                sptr = (S*)(char**)( (uint8_t*)midref->data + dataptr[0] );
+            else
+                qptr = (Q*)(char**)( (uint8_t*)midref->data + dataptr[1] );
+
+            if( searchby == 0 ) {
+                //LLAMA_LOG_INFO("%s: compare s %p(%zu) vs %p\n", __func__, (void*)*sptr, M, (void*)*valS);
+                if( *sptr < *valS ) {
+                    L = M = M+1;
+                } else if( *sptr == *valS ) {
+                    L = M;
+                    break;
+                } else {
+                    R = M;
+                }
+            } else {
+                //LLAMA_LOG_INFO("%s: compare q %p vs %p\n", __func__, (void*)*qptr, (void*)*valQ);
+                if( *qptr < *valQ ) {
+                    L = M = M+1;
+                } else if( *qptr == *valQ ) {
+                    L = M;
+                    break;
+                } else {
+                    R = M;
+                }
+            }
+        }
+        if( M == count ) {
+            miditem++;
+            if( miditem == units ) {
+                miditem=0;
+                listno++;
+            }
+            LLAMA_TRACK("sp_search_ub", 6);
+            return NULL;
+        } else if( M == 0 ) {
+            mid = data[searchby]->head;
+            miditem=0;
+            listno=0;
+        } else {
+            LLAMA_TRACK("sp_search_ub", 7);
+            mid = data[searchby]->get( M, miditem, listno, searchby );
+            LLAMA_TRACK("sp_search_ub", 8);
+        }
+        buf = (void**)mid->data;
+        midref = (sp_searchable*)( buf[miditem] );
+        //LLAMA_LOG_INFO("%s: M=%zu, miditem=%u, listno=%u\n", __func__, M, miditem, listno);
+        LLAMA_TRACK("sp_search_ub", 9);
+        return midref;
+    }
+    void insert( T *ptr )
+    {
+        void **buf;
+        size_t M;
+        uint16_t mi, ln;
+        //LLAMA_LOG_INFO("pool insert count=%zu: %p\n", count, ptr);
+        sp_searchable *sb = new sp_searchable(ptr);
+        sp_searchable *res;
+
+        LLAMA_TRACK("sp_insert", 0);
+        res = bsub(0, ptr, M, mi, ln);
+        sp_linked *arr = data[0]->get(ln);
+        if( M != count ) {
+            shift_pointers_r(arr, mi, 0);
+        } else {
+            arr->count++;
+        }
+        LLAMA_TRACK("sp_insert", 10);
+        buf = (void**)arr->data;
+        buf[mi] = (void*)sb;
+        sb->inds[0] = ln;
+        sb->refs[0] = mi;
+
+        LLAMA_TRACK("sp_insert", 20);
+        res = bsub(1, ptr, M, mi, ln);
+        arr = data[1]->get(ln);
+        if( M != count ) {
+            shift_pointers_r(arr, mi, 1);
+        } else {
+            arr->count++;
+        }
+        LLAMA_TRACK("sp_insert", 40);
+        buf = (void**)arr->data;
+        buf[mi] = (void*)sb;
+        sb->inds[1] = ln;
+        sb->refs[1] = mi;
+
+        count++;
+        LLAMA_TRACK("sp_insert", 9);
+    }
+    void erase( T *ptr )
+    { //! todo: reduce gaps after erasure to increase speed
+        uint16_t mi, ln;
+        size_t M;
+        void **buf;
+        sp_searchable *sp;
+        sp_linked *arr;
+
+        LLAMA_TRACK("sp_erase", 0);
+        //LLAMA_LOG_INFO("%s: count=%zu\n", __func__, count);
+        sp_searchable *pre = bs(0, ptr, M, mi, ln);
+        if( !pre ) {
+            LLAMA_LOG_ERROR("%s: not found 0 %p\n", __func__, ptr);
+            PrintStackTrace();
+            throw "not found on erase";
+            return;
+        }
+        LLAMA_TRACK("sp_erase", 1);
+        arr = data[0]->get(ln);
+        buf = (void**)arr->data;
+        sp = (sp_searchable*)buf[mi];
+        LLAMA_TRACK("sp_erase", 2);
+        if( !sp ) {
+            LLAMA_LOG_INFO("%s: not found 2 %p (found %p)\n", __func__, ptr, sp->data);
+            PrintStackTrace();
+            throw "not found on erase";
+            return;
+        }
+        if( sp->data != (void*)ptr ) {
+            LLAMA_LOG_INFO("%s: not found 1 %p (found %p)\n", __func__, ptr, sp->data);
+            PrintStackTrace();
+            throw "not found on erase";
+            return;
+        }
+        shift_pointers_l(arr, mi, 0);
+
+        LLAMA_TRACK("sp_erase", 3);
+        arr = data[1]->get( sp->inds[1] );
+        buf = (void**)arr->data;
+        if( buf[sp->refs[1]] != (void*)sp ) {
+            LLAMA_LOG_INFO("%s: mismatch %p vs %p\n", __func__, sp, buf[sp->refs[1]]);
+            PrintStackTrace();
+            throw "not found on erase";
+            return;
+        }
+        LLAMA_TRACK("sp_erase", 4);
+        shift_pointers_l(arr, sp->refs[1], 1);
+
+        count--;
+        LLAMA_TRACK("sp_erase", 5);
+    }
+};
+
+void report_pool_bysize(void*);
+void report_pool_contig(void*);
+
+struct senmemory_pool {
+    Sp_searchnest<Llama_mem, void*, size_t> *used;
+    Sp_searchnest<Llama_mem, void*, size_t> *loose; // for allocation
+    size_t total_alloced=0;
+
+    senmemory_pool() {
+        Llama_mem *_0=NULL;
+        used = new Sp_searchnest<Llama_mem, void*, size_t>((uint16_t)512,(uint16_t)((char*)&(_0->addr) - (char*)_0), (uint16_t)((char*)&(_0->sz) - (char*)_0));
+        loose = new Sp_searchnest<Llama_mem, void*, size_t>((uint16_t)512,(uint16_t)((char*)&(_0->addr) - (char*)_0), (uint16_t)((char*)&(_0->sz) - (char*)_0));
+    }
     void _report(void)
     {
-
         void *last=NULL;
         size_t lastsz=0;
-        LLAMA_LOG_INFO("contig has %d entries and bysize has %d.\n", loose_contig.size(), loose_bysize.size());
-        for( auto it : loose_contig ) {
-            LLAMA_LOG_INFO("alloc: %p +%zu\n", (*it).addr, (*it).sz );
-            if( (*it).addr <= last ) {
-                LLAMA_LOG_INFO("[error: out of order]\n");
-            }
-            last=(*it).addr;
-        }
-
-        for( auto it : loose_bysize ) {
-            LLAMA_LOG_INFO("sz: %p +%zu\n", (*it).addr, (*it).sz );
-            if( (*it).sz < lastsz ) {
-                LLAMA_LOG_INFO("[error: out of order]\n");
-            }
-            lastsz = (*it).sz;
-        }
+        LLAMA_LOG_INFO("loose has %zu entries.\n", loose->count);
+        report_pool_contig(NULL);
+        report_pool_bysize(NULL);
+        loose->data[0]->forall( report_pool_contig );
+        loose->data[1]->forall( report_pool_bysize );
     }
     void _record(Llama_mem *mem)
     {
-        memiter m = std::lower_bound(loose_contig.begin(), loose_contig.end(), mem, [](Llama_mem *a, Llama_mem *b) {
-            return a->addr < b->addr;
-        });
-        /* no, let's not join neighboring memory spaces. we like them the size they are
-        if( m != loose_contig.begin() && loose_contig.size() > 1 ) m--;
-        if( m != loose_contig.end() ) {
-            if( (void*)((char*)(*m)->addr + (*m)->sz) >= mem->addr ) {
-                (*m)->sz += mem->sz;
-                delete(mem);
-                return;
-            }
-            m++;
-            if( m != loose_contig.end() ) {
-                if( (void*)((char*)mem->addr + (*m)->sz) >= (*m)->addr ) {
-                    (*m)->addr = mem->addr;
-                    (*m)->sz += mem->sz;
-                    delete(mem);
-                    return;
-                }
-            }
-        }
-        */
-        loose_contig.insert(m, mem);
-
-        m = std::lower_bound(loose_bysize.begin(), loose_bysize.end(), mem, [](Llama_mem *a, Llama_mem *b) {
-            return a->sz < b->sz;
-        });
-        loose_bysize.insert(m, mem);
-
-        if( loose_contig.size() != loose_bysize.size() ) {
-            _report();
-        }
+        //LLAMA_LOG_INFO("_record large memory: %p/%zu refc=%u\n", mem->addr, mem->sz, *mem->refc);
+        loose->insert(mem);
+        if( loose->count > 200 && loose->count%100 == 0 )
+            LLAMA_LOG_INFO("%s: loose count %zu\n", __func__, loose->count);
     }
     void *alloc(size_t sz) {
-        // shortcut:       return malloc(sz);
+        // shortcut:
+        if( sz > 10240 || sz < 128 )
+            return malloc(sz);
 
-        Llama_mem ptr_ref, *new_ptr;
-        Llama_mem *remnant=NULL, *usable=NULL;
+        Llama_mem ptr_ref, *new_ptr=NULL;
+        Llama_mem *remnant=NULL, *usable=NULL, *usable2;
         void *ptr;
-        memiter m;
+        sp_searchable *sp=NULL, *sp2=NULL;
+        sp_linked *iter=NULL;
+        size_t M;
+        uint16_t offset, listno;
+        void **buf;
 
-        if( sz >= 64 ) {
-            ptr_ref.sz = sz;
-            m = std::lower_bound(loose_bysize.begin(), loose_bysize.end(), &ptr_ref, [](Llama_mem *a, Llama_mem *b) {
-                return a->sz < b->sz;
-            });
-            if( m != loose_bysize.end() ) {
-                usable = *m;
-                if( usable->sz == sz || usable->sz >= sz*2 ) {
+        //llama_enable_tracker("sp_search");
+        //llama_enable_tracker("sp_search_ub");
+        //llama_enable_tracker("sp_free");
+        //llama_enable_tracker("sp_erase");
+        //llama_enable_tracker("sp_alloc");
+        //llama_enable_tracker("sp_insert");
+
+        LLAMA_TRACK("sp_alloc", 0);
+
+        ptr_ref.sz = sz;
+        //LLAMA_LOG_INFO("%s: locate size %zu\n", __func__, sz);
+        sp = loose->bsub(1, &ptr_ref, M, offset, listno);
+        if( sp ) {
+            if( M == 0 ) {
+                iter = loose->data[1]->head;
+                offset = 0;
+            } else {
+                iter = loose->data[1]->get(listno);
+            }
+        } else {
+            iter = NULL;
+        }
+        LLAMA_TRACK("sp_alloc", 1);
+        /*
+        m = std::lower_bound(loose_bysize.begin(), loose_bysize.end(), &ptr_ref, [](Llama_mem *a, Llama_mem *b) {
+            return a->sz < b->sz;
+        });*/
+        if( iter ) { // && (((void*)iter->data)[offset]) ) {
+            buf = (void**)iter->data;
+            if( buf[offset] != NULL ) {
+                LLAMA_TRACK("sp_alloc", 11);
+                //LLAMA_LOG_INFO("%s: iter=%p sz=%zu offset=%u\n", __func__, iter, sz, offset);
+                buf = (void**)iter->data;
+                sp = (sp_searchable*)buf[offset];
+                usable = (Llama_mem*)sp->data;
+                LLAMA_TRACK("sp_alloc", 12);
+                //LLAMA_LOG_INFO("%s: usable addr=%p sz=%zu\n", __func__, usable->addr, usable->sz);
+                if( usable->sz == sz || usable->sz >= sz+144 ) {
                 } else {
-                    ptr_ref.sz = sz*2;
-                    memiter m = std::lower_bound(loose_bysize.begin(), loose_bysize.end(), &ptr_ref, [](Llama_mem *a, Llama_mem *b) {
-                        return a->sz < b->sz;
-                    });
-                    if( m != loose_bysize.end() )
-                        usable = *m;
-                    else
-                        usable = NULL;
+                    size_t tgtsz = sz+144;
+                    ptr_ref.sz = tgtsz;
+
+                    //LLAMA_LOG_INFO("%s: locate double %zu\n", __func__, ptr_ref.sz);
+                    LLAMA_TRACK("sp_alloc", 13);
+                    sp = loose->bsub(1, &ptr_ref, M, offset, listno);
+                    LLAMA_TRACK("sp_alloc", 14);
+                    if( sp ) {
+                        iter = loose->data[1]->get( listno );
+                        buf = (void**)iter->data;
+                        if( buf[offset] != NULL ) {
+                            sp = (sp_searchable*)buf[offset];
+                            usable = (Llama_mem*)sp->data;
+                            LLAMA_TRACK("sp_alloc", 15);
+                            if( usable->sz < tgtsz || usable->sz >= sz*3 ) {
+                                iter = NULL;
+                            }
+                            LLAMA_TRACK("sp_alloc", 16);
+                        }
+                    } else {
+                        iter = NULL;
+                    }
+                    usable=NULL;
+                    if( iter ) {
+                        LLAMA_TRACK("sp_alloc", 17);
+                        if( buf[offset] != NULL ) {
+                            //LLAMA_LOG_INFO("%s: found double iter=%p offset=%u\n", __func__, iter, offset);
+                            sp = (sp_searchable*)buf[offset];
+                            usable = (Llama_mem*)sp->data;
+                            //LLAMA_LOG_INFO("use %p:%zu\n", usable->addr, usable->sz);
+                        } else {
+                            usable = NULL;
+                        }
+                        LLAMA_TRACK("sp_alloc", 18);
+                    }
                 }
             }
-            if( m != loose_bysize.end() && usable ) {
-                loose_bysize.erase(m); // we have to erase because we may change its size
-                m = std::lower_bound(loose_contig.begin(), loose_contig.end(), usable, [](Llama_mem *a, Llama_mem *b) {
-                    return a->addr < b->addr;
-                });
-                bool found=false;
-                do {
-                    if( *m == usable ) {
-                        loose_contig.erase(m);
-                        found=true;
-                        break;
-                    }
-                    m--;
-                    if( m < loose_contig.begin() ) break;
-                } while( (*m)->addr > usable->addr );
-                if( ( (*m)->addr < usable->addr || m < loose_contig.begin() ) && !found ) {
+        }
+        LLAMA_TRACK("sp_alloc", 2);
+        if( usable ) {
+            if( usable->sz < sz ) {
+            } else {
+                //LLAMA_LOG_INFO("%s: erase usable %p (%p: %zu)\n", __func__, usable, usable->addr, usable->sz);
+                loose->erase(usable); // we have to erase because we may change its size
 
-                    LLAMA_LOG_INFO("contig has %d entries and bysize has %d.\n", loose_contig.size(), loose_bysize.size());
-                    LLAMA_LOG_ERROR("alloc(%zu): lost a pointer from loose_contig\n", sz);
-                    LLAMA_LOG_ERROR("alloc(%zu): lost a pointer from loose_contig\n", sz);
-                    LLAMA_LOG_ERROR("alloc(%zu): lost a pointer from loose_contig\n", sz);
-                    void *last=NULL;
-                    size_t lastsz=0;
-                    bool past_usable=false;
-                    for( auto it : loose_contig ) {
-                        LLAMA_LOG_INFO("alloc: %p +%zu\n", (*it).addr, (*it).sz );
-                        if( (*it).addr <= last ) {
-                            LLAMA_LOG_INFO("[error: out of order]\n");
-                        }
-                        last=(*it).addr;
-                        if( !past_usable && (*it).addr > usable->addr ) {
-                            LLAMA_LOG_INFO("[past_usable]\n");
-                            past_usable=true;
-                        }
-                    }
-                    LLAMA_LOG_INFO("alloc target: %p, ptr_ref: %p\n", (*m)->addr, usable->addr);
-                    past_usable=false;
-                    for( auto it : loose_bysize ) {
-                        LLAMA_LOG_INFO("sz: %p +%zu\n", (*it).addr, (*it).sz );
-                        if( (*it).sz < lastsz ) {
-                            LLAMA_LOG_INFO("[error: out of order]\n");
-                        }
-                        lastsz = (*it).sz;
-                        if( !past_usable && (*it).sz > sz ) {
-                            LLAMA_LOG_INFO("[past_usable]\n");
-                            past_usable=true;
-                        }
-                    }
-                    LLAMA_LOG_INFO("alloc target: %zu\n", sz);
-                    //PrintStackTrace(); // pst doesn't work
-                    usable = new Llama_mem();
-                    usable->sz = sz;
-                    usable->addr = calloc(sz,1);
-                }
-
+                //LLAMA_TRACK("sp_alloc", 21);
                 if( usable->sz != sz ) {
                     size_t addr_ptr, new_sz=usable->sz - sz;
                     addr_ptr = (size_t)( (char*)usable->addr + sz );
-                    if( (addr_ptr%16) != 0 ) {
-                        new_sz -= 16 - ( addr_ptr%16 );
-                        addr_ptr += 16 - ( addr_ptr%16 );
+                    uint8_t offset_sz = 16 - ( addr_ptr%16 );
+                    if( (addr_ptr%16) != 0 && new_sz > offset_sz ) {
+                        addr_ptr += offset_sz;
+                        new_sz = usable->sz - (((char*)addr_ptr) - ((char*)usable->addr));
                     }
+                    //LLAMA_TRACK("sp_alloc", 22);
                     if( new_sz >= 16 ) {
-                        remnant = new Llama_mem();
+                        //LLAMA_LOG_INFO("%s: create remnant size %zu ptr %p\n", __func__, new_sz, addr_ptr);
+                        remnant = new Llama_mem(usable);
                         remnant->sz = new_sz;
                         remnant->addr = (void*)( addr_ptr );
                         _record(remnant);
                         usable->sz -= new_sz;
                     }
+                    //LLAMA_TRACK("sp_alloc", 23);
                 }
 
                 new_ptr = usable;
-            } else {
-                new_ptr = new Llama_mem();
-                new_ptr->sz = sz;
-                new_ptr->addr = calloc(sz,1);
-                if( sz > 100000 ) {
-                    LLAMA_LOG_INFO("alloc %zu %p\n", sz, new_ptr->addr);
-                    //PrintStackTrace();
-                } else {
-                    //LLAMA_LOG_INFO("alloc %zu %p\n", sz, new_ptr->addr);
-                }
-                //memset(new_ptr->addr, 0, sz);
+                //LLAMA_TRACK("sp_alloc", 24);
             }
-        } else {
-            new_ptr = new Llama_mem();
+        }
+        if( !new_ptr ) {
+            //LLAMA_TRACK("sp_alloc", 3);
+            new_ptr = new Llama_mem(calloc(sz,1));
+            if( !new_ptr->addr ) {
+                LLAMA_LOG_INFO("%s: allocation of %zu bytes failed.\n", __func__, sz);
+                throw "allocation error\n";
+            }
             new_ptr->sz = sz;
-            new_ptr->addr = calloc(sz,1);
+            memset(new_ptr->addr, 0, sz);
+            total_alloced += sz/100;
+            //LLAMA_TRACK("sp_alloc", 4);
         }
 
-        m = std::lower_bound(used.begin(), used.end(), new_ptr, [](Llama_mem *a, Llama_mem *b) {
-            return a->addr < b->addr;
-        });
-        used.insert( m, new_ptr );
+        //llama_enable_tracker("sp_search_ub");
+        //llama_enable_tracker("sp_search");
 
+        used->insert( new_ptr );
+
+        //llama_disable_tracker("sp_search_ub");
+        //llama_disable_tracker("sp_search");
+        //LLAMA_TRACK("sp_alloc", 5);
+        /*if( total_alloced > 100000 && (total_alloced/100)%100 == 0 ) {
+            LLAMA_LOG_INFO("%s: total_alloced=%zu*100\n", __func__, total_alloced);
+        }
+        if( used->count > 100 && used->count%100 == 0 )
+            LLAMA_LOG_INFO("%s: used count %zu %p (%p) size %zu\n", __func__, used->count, new_ptr, new_ptr->addr, sz);
+
+        */
+        LLAMA_TRACK("sp_alloc", 9);
         return new_ptr->addr;
     }
     void release(void *ptr) {
-        /* shortcut:
-        if( ptr == NULL ) return;
+        // shortcut:
+        /*
         free(ptr);
         return;
         */
 
         Llama_mem ptr_ref;
+        sp_searchable *sp;
+        sp_linked *iter;
+        size_t M;
+        uint16_t offset, listno;
+        void **buf;
+
+        LLAMA_TRACK("sp_free", 0);
+        //LLAMA_LOG_INFO("%s: %p\n", __func__, ptr);
         ptr_ref.addr = ptr;
-        memiter m = std::lower_bound(used.begin(), used.end(), &ptr_ref, [](Llama_mem *a, Llama_mem *b) {
-            return a->addr < b->addr;
-        });
-        if( (*m)->addr != ptr || m == used.end() ) {
-            LLAMA_LOG_ERROR("Invalid free of %p, used size %d\n", ptr, used.size());
+        sp = used->bs(0, &ptr_ref, M, offset, listno);
+        iter = used->data[0]->get(listno);
+        buf = (void**)iter->data;
+        if( !iter || !buf[offset] ) {
+            LLAMA_TRACK("sp_free", 2);
+            free(ptr);
+            LLAMA_TRACK("sp_free", 3);
+            return;
+            /*
+            LLAMA_LOG_ERROR("Invalid free of %p, 1 used size %zu\n", ptr, used->count);
             PrintStackTrace();
-            //free(ptr);
+            throw "Error";
+            return;*/
+        }
+        Llama_mem *mem = (Llama_mem*)sp->data;
+        if( mem->addr != ptr ) {
+            LLAMA_TRACK("sp_free", 5);
+            free(ptr);
+            LLAMA_TRACK("sp_free", 6);
+            return;
+            /*
+            LLAMA_LOG_ERROR("Invalid free of %p, 2 used size %zu (found %p at %zu (%u))\n",
+                            ptr, used->count, mem->addr, M, offset);
+            PrintStackTrace();
             throw "Error";
             return;
+            */
         }
-        Llama_mem *mem = *m;
         memset( mem->addr, 0, mem->sz );
-        used.erase(m);
+        LLAMA_TRACK("sp_free", 7);
+        used->erase(mem);
+        //LLAMA_LOG_INFO("%s: ->record\n", __func__);
+        LLAMA_TRACK("sp_free", 8);
         _record(mem);
+        LLAMA_TRACK("sp_free", 9);
     }
 };
+
+void report_pool_bysize( void *ptr )
+{
+    static Llama_mem *lastptr=NULL;
+
+    if( ptr ) {
+        Llama_mem *it = (Llama_mem*)ptr;
+        LLAMA_LOG_INFO("sz: %p +%zu\n", it->addr, it->sz );
+        if( it->sz < lastptr->sz ) {
+            LLAMA_LOG_INFO("[error: out of order]\n");
+        }
+    }
+    lastptr = (Llama_mem*)ptr;
+}
+
+void report_pool_contig( void *ptr )
+{
+    static Llama_mem *lastptr=NULL;
+
+    if( ptr ) {
+        Llama_mem *it = (Llama_mem*)ptr;
+        LLAMA_LOG_INFO("alloc: %p +%zu\n", it->addr, it->sz );
+        if( it->addr <= lastptr->addr && lastptr ) {
+            LLAMA_LOG_INFO("[error: out of order]\n");
+        }
+    }
+    lastptr = (Llama_mem*)ptr;
+}
+
 
 _Pool myPool;
 bool pool_initialized=false;
@@ -1250,12 +1984,20 @@ void *pool_alloc(size_t sz)
         pool_initialized=true;
         new (&myPool) _Pool;
     }
-    return myPool.alloc(sz);
+    void *p = myPool.alloc(sz);
+    if( !p ) {
+        LLAMA_LOG_INFO("Invalid pointer 2\n");
+    }
+    return p;
 }
-void pool_free(void *ptr)
+void my_pool_free(void *ptr)
 {
+    if( !ptr ) {
+        LLAMA_LOG_INFO("Invalid pointer 3\n");
+    }
     myPool.release(ptr);
 }
+#define pool_free(x) my_pool_free(x); x=NULL
 
 
 struct llama_file {
@@ -1264,8 +2006,10 @@ struct llama_file {
     size_t size;
 
     llama_file(const char * fname, const char * mode) {
+        //LLAMA_LOG_INFO("fopen('%s','%s')\n", fname, mode);
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
+            LLAMA_LOG_INFO("%s: cannot find '%s'\n", __func__, fname);
             return;
         }
         seek(0, SEEK_END);
@@ -1297,16 +2041,21 @@ struct llama_file {
         char *buf;
 
         read_raw(&len, sizeof(len));
-        buf = (char*)myPool.alloc(len+1);
+        buf = (char*)pool_alloc(len+1);
         read_raw(buf, len);
         buf[len] = '\0';
         std::string ret = buf;
-        myPool.release(buf);
+        pool_free(buf);
+        buf=NULL;
         return ret;
     }
     void write_string(std::string buf) const {
         uint32_t len = buf.length();
         write_raw(&len, sizeof(len));
+        write_raw(buf.c_str(), len);
+    }
+    void write_text(std::string buf) const {
+        uint32_t len = buf.length();
         write_raw(buf.c_str(), len);
     }
 
@@ -1315,11 +2064,13 @@ struct llama_file {
             return;
         }
         errno = 0;
-        std::size_t ret = std::fread(ptr, len, 1, fp);
+        std::size_t ret = std::fread(ptr, 1, len, fp);
         if (ferror(fp)) {
+            LLAMA_LOG_INFO("%s read error: %s", __func__, strerror(errno));
             throw std::runtime_error(format("read error: %s", strerror(errno)));
         }
-        if (ret != 1) {
+        if (ret != len) {
+            LLAMA_LOG_INFO("%s read error (EOF) read %zu of %zu", __func__, ret, len);
             throw std::runtime_error("unexpectedly reached end of file");
         }
     }
@@ -1340,9 +2091,17 @@ struct llama_file {
             return;
         }
         errno = 0;
-        size_t ret = std::fwrite(ptr, len, 1, fp);
-        if (ret != 1) {
+        size_t ret = std::fwrite(ptr, 1, len, fp);
+        if (ret != len) {
+            fprintf(stderr,"Write error: %d\n",ferror(fp));
+            clearerr(fp);
             throw std::runtime_error(format("write error: %s", strerror(errno)));
+        }
+
+        if (fflush(fp)) {
+          fprintf(stderr,"Flush error: %d\n",ferror(fp));
+          clearerr(fp);
+          throw std::runtime_error(format("write error: %s", strerror(errno)));
         }
     }
 
@@ -1353,12 +2112,47 @@ struct llama_file {
         write_raw(&val, sizeof(val));
     }
 
+    void close() {
+        if( fp ) {
+            if (fflush(fp)) {
+              fprintf(stderr,"Flush error: %d\n",ferror(fp));
+              clearerr(fp);
+              throw std::runtime_error(format("write error: %s", strerror(errno)));
+            }
+            std::fclose(fp);
+            fp=NULL;
+        }
+    }
+
     ~llama_file() {
         if (fp) {
+            if (fflush(fp)) {
+              fprintf(stderr,"Flush error: %d\n",ferror(fp));
+              clearerr(fp);
+            }
             std::fclose(fp);
         }
     }
 };
+
+std::set<std::string> trackers;
+
+void LLAMA_TRACK(std::string tag, size_t value)
+{
+    if( trackers.count(tag) == 0 ) return;
+    llama_file *f = new llama_file(tag.c_str(), "w");
+    f->write_text( std::to_string(value) );
+    f->close();
+}
+void llama_enable_tracker(std::string tag)
+{
+    trackers.insert(tag);
+}
+void llama_disable_tracker(std::string tag)
+{
+    trackers.erase(tag);
+}
+
 
 struct llama_mmap {
     void * addr;
@@ -2051,6 +2845,8 @@ typedef struct system_memory System_memory;
 
 typedef struct llm_org_context Org_context;
 
+ggml_backend_t get_backend(ggml_tensor *);
+
 // ring-buffer of cached KV data
 typedef struct llama_kv_cache {
     uint32_t size = 0;
@@ -2069,6 +2865,170 @@ typedef struct llama_kv_cache {
 
     std::vector<struct ggml_tensor *> k_l; // per layer
     std::vector<struct ggml_tensor *> v_l;
+
+    struct kv_data {
+        size_t start;
+        size_t len;
+        size_t alloced;
+        void *ptr;
+    };
+
+    std::vector<kv_data> pre_k[32];
+    std::vector<kv_data> pre_v[32];
+    void prefit_clear( void )
+    {
+        std::vector<kv_data>::iterator it;
+        for( int il=0; il<32; il++ ) {
+            for( it = pre_k[il].begin(); it != pre_k[il].end(); it++ ) {
+                if( (*it).alloced > 0 ) {
+                    pool_free( (*it).ptr );
+                }
+            }
+            for( it = pre_v[il].begin(); it != pre_v[il].end(); it++ ) {
+                if( (*it).alloced > 0 ) {
+                    pool_free( (*it).ptr );
+                }
+            }
+            pre_k[il].clear();
+            pre_v[il].clear();
+        }
+    }
+    void prefit_set( std::vector<kv_data> *pre, void *data, size_t start, size_t len )
+    {
+        std::vector<kv_data>::iterator it;
+        kv_data z;
+        
+        if( !data ) {
+            LLAMA_LOG_INFO("Invalid pointer 1\n");
+            throw "invalid pointer";
+        }
+
+        //LLAMA_LOG_INFO("prefit_set(%zu,%zu)\n", start, len);
+
+        for( it = pre->begin(); it != pre->end(); it++ ) {
+            /*if( (*it).start + (*it).len == start ) {
+                if( (*it).len + len > (*it).alloced ) {
+                    size_t newlen = (*it).len + len;
+                    if( newlen < 256000 ) newlen *= 2;
+                    else if( len < 1024 ) newlen += len*1024;
+                    else newlen += len*16;
+
+                    void *buf = pool_alloc( newlen );
+                    memcpy( buf, (*it).ptr, (*it).len );
+                    memcpy( (void*)( (char*)buf + (*it).len ), data, len );
+                    if( (*it).alloced > 0 ) {
+                        pool_free( (*it).ptr );
+                    }
+                    (*it).alloced = newlen;
+                    (*it).ptr = buf;
+                } else {
+                    memcpy( (void*)( (char*)(*it).ptr + (*it).len ), data, len );
+                }
+                (*it).len += len;
+                //LLAMA_LOG_INFO("prefit_set done 1\n", start, len);
+                return;
+            }*/
+            if( (*it).start > start ) {
+                z.start = start;
+                z.len = len;
+                z.ptr = data;
+                z.alloced = 0;
+                pre->insert(it, z);
+                //LLAMA_LOG_INFO("prefit_set done 2\n", start, len);
+                return;
+            } else if( (*it).start + (*it).len > start ) {
+                LLAMA_LOG_INFO("prefit overflow 2!\n");
+                throw "prefit overthrow!\n";
+            }
+        }
+        z.start = start;
+        z.len = len;
+        z.ptr = data;
+        z.alloced = 0;
+        pre->push_back(z);
+        //LLAMA_LOG_INFO("prefit_set done 3\n", start, len);
+    }
+#define max_buflen 32767
+    void prefit_write(void)
+    {
+        std::vector<kv_data>::iterator it, itprev, itfirst;
+        size_t buflen, bufstart;
+        uint8_t buf[max_buflen];
+
+        LLAMA_LOG_INFO("prefit_write(%s): %zu k %zu v\n", quick_ts().c_str(), pre_k[0].size(), pre_v[0].size());
+        for( int il=0; il<32; il++ ) {
+            it = pre_k[il].begin();
+            //LLAMA_LOG_INFO("layer %d %zu\n", il, it->len);
+            if( it != pre_k[il].end() ) {
+                itfirst = itprev = it;
+                buflen = it->len;
+            }
+            while( true ) {
+                while( it != pre_k[il].end() && buflen >= max_buflen ) {
+                    ggml_backend_tensor_set(k_l[il], it->ptr, it->start, it->len );
+                    it++;
+                    itprev=itfirst=it;
+                    buflen=it->len;
+                }
+                if( itfirst == pre_k[il].end() ) break;
+                if( it == itprev && it != pre_k[il].end()  )
+                    it++;
+                while( it != pre_k[il].end() && buflen + it->len < max_buflen && itprev->start + itprev->len == it->start ) {
+                    itprev = it;
+                    buflen += it->len;
+                    it++;
+                }
+                buflen=0;
+                for( itprev=itfirst; itprev!=it; itprev++ ) {
+                    memcpy(buf+buflen, itprev->ptr, itprev->len);
+                    buflen += itprev->len;
+                }
+                ggml_backend_tensor_set(k_l[il], buf, itfirst->start, buflen );
+                if( it == pre_k[il].end() ) break;
+                itprev = itfirst = it;
+                buflen = it->len;
+            }
+            //LLAMA_LOG_INFO("prefit_write(%s): %d step 2\n", quick_ts().c_str(), il);
+
+            //LLAMA_LOG_INFO("layer %d v\n", il);
+            it = pre_v[il].begin();
+            if( it != pre_v[il].end() ) {
+                itfirst = itprev = it;
+                buflen = it->len;
+            }
+            while( true ) {
+                while( it != pre_v[il].end() && buflen >= max_buflen ) {
+                    ggml_backend_tensor_set(v_l[il], it->ptr, it->start, it->len );
+                    it++;
+                    itprev=itfirst=it;
+                    buflen=it->len;
+                }
+                if( itfirst == pre_v[il].end() ) break;
+                if( it == itprev && it != pre_v[il].end() )
+                    it++;
+                while( it != pre_v[il].end() && buflen + it->len < max_buflen && itprev->start + itprev->len == it->start ) {
+                    itprev = it;
+                    buflen += it->len;
+                    it++;
+                }
+                buflen=0;
+
+                for( itprev=itfirst; itprev!=it; itprev++ ) {
+                    memcpy(buf+buflen, itprev->ptr, itprev->len);
+                    buflen += itprev->len;
+                }
+                ggml_backend_tensor_set(v_l[il], buf, itfirst->start, buflen );
+                if( it == pre_v[il].end() ) break;
+                itprev = itfirst = it;
+                buflen = it->len;
+            }
+            /*
+            for( it = pre_v[il].begin(); it != pre_v[il].end(); it++ ) {
+                ggml_backend_tensor_set(v_l[il], (*it).ptr, (*it).start, (*it).len );
+            }*/
+        }
+        LLAMA_LOG_INFO("prefit_write(%s): done\n", quick_ts().c_str());
+    }
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
     void prepare(void)
@@ -2078,15 +3038,18 @@ typedef struct llama_kv_cache {
         new (&(v_l)) std::vector<struct ggml_tensor *>;
         new (&ctxs) std::vector<struct ggml_context *>;
         new (&bufs) std::vector<ggml_backend_buffer_t>;
+        for( int il=0; il<32; il++ ) {
+            new (&(pre_k[il])) std::vector<kv_data>;
+            new (&(pre_v[il])) std::vector<kv_data>;
+        }
     }
 
     void *buffer( size_t len )
     {
-        void *x = (void*)myPool.alloc( 32 * 2048 * len );
+        void *x = (void*)pool_alloc( 32 * 2048 * len );
         return x;
     }
-
-    void read( int startpt, size_t n_tokens, void *kx, void *vx )
+    void read( size_t startpt, size_t n_tokens, void *kx, void *vx )
     {
         size_t bufptr;
 
@@ -2098,16 +3061,67 @@ typedef struct llama_kv_cache {
 
         size_t p, p_sz = 2 * size;
 
-        LLAMA_LOG_INFO("kv_read: startpt %d n_tokens %zu\n", startpt, n_tokens);
+        LLAMA_LOG_INFO("kv_read(%s): startpt %zu n_tokens %zu\n", quick_ts().c_str(), startpt, n_tokens);
+
+        ggml_backend_t backend_res = get_backend(k_l[0]);
 
         for( int il=bufptr=0; il<32; il++ ) {
-            ggml_backend_tensor_get(k_l[il], (void*)((char*)kx + bufptr), st_k, k );
-            for( int i=p=0; i<1024; i++, p += p_sz, bufptr += v ) {
-                ggml_backend_tensor_get(v_l[il], (void*)((char*)vx + bufptr), st_v+p, v );
+            //LLAMA_LOG_INFO("kv_read(%s): %d\n", quick_ts().c_str(), il);
+            ggml_backend_tensor_get_async(backend_res, k_l[il], (void*)((char*)kx + bufptr), st_k, k );
+            for( int i=0, p=st_v; i<1024; i++, p += p_sz, bufptr += v ) {
+                ggml_backend_tensor_get_async(backend_res, v_l[il], (void*)((char*)vx + bufptr), p, v );
             }
         }
 
-        //ggml_backend_synchronize(current_context->backend_res);
+        ggml_backend_synchronize(backend_res);
+        LLAMA_LOG_INFO("kv_read(%s): done\n", quick_ts().c_str());
+    }
+
+    void read2( size_t startpt, size_t offset, size_t n_tokens, std::vector<ggml_fp16_t> kx[32], std::vector<ggml_fp16_t> vx[32] )
+    {
+        size_t bufptr;
+
+        size_t v = 2 * n_tokens;
+        size_t k = 1024 * v;
+
+        size_t st_t = 2048 * startpt;
+        size_t off_t = 2048 * offset;
+
+        size_t p, p_sz = 2 * size;
+        size_t st_v = startpt * 2;
+
+        size_t endpt = startpt+n_tokens;
+
+        LLAMA_LOG_INFO("kv_read2(%s): startpt %zu offset %zu n_tokens %zu\n", quick_ts().c_str(), startpt, offset, n_tokens);
+
+        ggml_backend_t backend_res = get_backend(k_l[0]);
+        // create a temporary buffer to hold the data before parsing it into the end of the vx lists
+        void *vx_buffers = pool_alloc( 32 * 2048 * n_tokens );
+
+        for( int il=0; il<32; il++, bufptr += k ) {
+            bufptr=off_t;
+            ggml_backend_tensor_get_async(backend_res, k_l[il], (void*)((char*)kx[il].data() + bufptr), st_t, k );
+
+            for( int i=0, p=startpt*2; i<1024; i++, p += p_sz ) {
+                ggml_backend_tensor_get_async(backend_res, v_l[il], (void*)((char*)vx_buffers + i*v + k*il), p, v );
+            }
+        }
+
+        ggml_backend_synchronize(backend_res);
+
+        LLAMA_LOG_INFO("kv_read2(%s): transfer\n", quick_ts().c_str());
+        for( int il=0; il<32; il++ ) {
+
+            size_t tx = k*il;
+            for( int i=0, p=0; i<1024; i++, p += v ) {
+                bufptr = i * 2;
+                for( int t=startpt; t<endpt; t++, bufptr += 2048, tx += 2 ) {
+                    *(ggml_fp16_t *)((char*)vx[il].data()+bufptr) = *(ggml_fp16_t *)((char*)vx_buffers + tx + p);
+                    //memcpy(backend_res, v_l[il], (void*)((char*)vx[il].data() + bufptr), p, 2 );
+                }
+            }
+        }
+        LLAMA_LOG_INFO("kv_read2(%s): done\n", quick_ts().c_str());
     }
 
     /*
@@ -2137,13 +3151,63 @@ typedef struct llama_kv_cache {
 
         size_t p, p_sz = size*2; // size refers to total # of tokens in this kb
 
-        LLAMA_LOG_INFO("kv_write: startpt %d n_tokens %zu\n", startpt, n_tokens);
+        LLAMA_LOG_INFO("kv_write(%s): startpt %d n_tokens %zu\n", quick_ts().c_str(), startpt, n_tokens);
         for( int il=bufptr=0; il<32; il++ ) {
-            ggml_backend_tensor_set(k_l[il], (void*)((char*)kx + bufptr), st_k, k );
-            for( int i=p=0; i<1024; i++, p += p_sz, bufptr += v ) {
-                ggml_backend_tensor_set(v_l[il], (void*)((char*)vx + bufptr), st_v+p, v );
+            //LLAMA_LOG_INFO("kv_write(%s): %d step 1\n", quick_ts().c_str(), il);
+            //LLAMA_LOG_INFO("pre_k %d: %zu %zu\n", il, st_k, st_k+k);
+            prefit_set( &(pre_k[il]), (void*)((char*)kx + bufptr), st_k, k );
+            //ggml_backend_tensor_set( k_l[il], (void*)((char*)kx + bufptr), st_k, k );
+            //LLAMA_LOG_INFO("kv_write(%s): %d step 2\n", quick_ts().c_str(), il);
+            for( int i=0, p=st_v; i<1024; i++, p += p_sz, bufptr += v ) {
+                //LLAMA_LOG_INFO("pre_v %d: %zu %zu\n", il, p, p+v);
+                prefit_set( &(pre_v[il]), (void*)((char*)vx + bufptr), p, v );
+                //ggml_backend_tensor_set( v_l[il], (void*)((char*)vx + bufptr), p, v );
             }
         }
+
+        LLAMA_LOG_INFO("kv_write(%s): done\n", quick_ts().c_str());
+    }
+
+    void write2( size_t startpt, size_t offset, size_t n_tokens, std::vector<ggml_fp16_t> kx[32], std::vector<ggml_fp16_t> vx[32] )
+    {
+        size_t bufptr;
+
+        size_t v = 2 * n_tokens;
+        size_t k = 1024 * v;
+
+        size_t st_t = 2048 * startpt;
+        size_t off_t = 2048 * offset;
+
+        size_t p, p_sz = 2 * size;
+        size_t st_v = startpt * 2;
+
+        size_t endpt = startpt+n_tokens;
+
+        LLAMA_LOG_INFO("kv_write2: startpt %zu offset %zu n_tokens %zu\n", startpt, offset, n_tokens);
+
+        ggml_backend_t backend_res = get_backend(k_l[0]);
+
+        void *vx_buffers = pool_alloc(n_tokens*2048*32);
+        bufptr=0;
+        for( int il=0; il<32; il++ ) {
+            for( int t=startpt; t<endpt; t++, st_v += 2 ) {
+                for( int i=0, p=st_v; i<1024; i++, p += p_sz, bufptr += 2 ) {
+
+                }
+            }
+        }
+        for( int il=0; il<32; il++ ) {
+            bufptr=off_t;
+            ggml_backend_tensor_set_async(backend_res, k_l[il], (void*)((char*)kx[il].data() + bufptr), st_t, k );
+            //! explore: it might be faster for short generations to write all of v over again instead of per-token per-head
+            for( int t=startpt; t<endpt; t++, st_v += 2 ) {
+                for( int i=0, p=st_v; i<1024; i++, p += p_sz, bufptr += 2 ) {
+                    ggml_backend_tensor_set_async(backend_res, v_l[il], (void*)((char*)vx[il].data() + bufptr), p, 2 );
+                }
+            }
+        }
+
+        ggml_backend_synchronize(backend_res);
     }
 
     /*
@@ -2247,7 +3311,7 @@ struct llm_org_context {
     void *k_buffer_layers[32];
     void *v_buffer_layers[32];
 
-    ggml_backend_t backend_cpu;
+    ggml_backend_t backend_cpu = nullptr;
     int n_threads;
 
     struct ggml_cgraph *get_shuffler()
@@ -2261,6 +3325,7 @@ struct llm_org_context {
     void run_kv_shuffler(void) {
         LLAMA_LOG_INFO("%s: run shuffler\n", __func__);
 
+        backend_cpu = ggml_backend_cpu_init();
         if (backend_cpu != nullptr) {
             ggml_backend_cpu_set_n_threads(backend_cpu, n_threads);
         }
@@ -2275,14 +3340,16 @@ struct llm_org_context {
             size_t tgt_v = buffer_target * 2;
             size_t tgt_k = tgt_v * 1024;
             size_t p_size = kv_self->size * 2;
+            ggml_backend_t backend_res = get_backend(kv_self->k_l[0]);
             for( int il = 0; il < 32; ++il ) { // it's the same amt of memory, 1024*overlap_v
-                ggml_backend_tensor_set(kv_self->k_l[il], k_buffer_layers[il], tgt_k, size_k );
+                ggml_backend_tensor_set_async(backend_res, kv_self->k_l[il], k_buffer_layers[il], tgt_k, size_k );
                 for( int i=0; i<1024; i++ ) {
-                    ggml_backend_tensor_set(kv_self->v_l[il], (void*)((char*)v_buffer_layers[il]+(size_v*i)), tgt_v+(p_size*i), size_v );
+                    ggml_backend_tensor_set_async(backend_res, kv_self->v_l[il], (void*)((char*)v_buffer_layers[il]+(size_v*i)), tgt_v+(p_size*i), size_v );
                 }
-                myPool.release(k_buffer_layers[il]);
-                myPool.release(v_buffer_layers[il]);
+                pool_free(k_buffer_layers[il]);
+                pool_free(v_buffer_layers[il]);
             }
+            ggml_backend_synchronize(backend_res);
             buffer_size = 0;
         }
         shuffler=NULL;
@@ -2337,8 +3404,8 @@ struct llm_org_context {
         LLAMA_LOG_INFO("%s: setting up swap_left from %d+%d to %d and from %d+%d to %d\n", from_st, from_sz, to_st, overlap_end, remnant, overlap_tgt );
         for( int il = 0; il < 32; ++il ) {
             if( overlap > 0 ) {
-                k_buffer_layers[il] = myPool.alloc( overlap_k );
-                v_buffer_layers[il] = myPool.alloc( overlap_k ); // it's the same amt of memory, 1024*overlap_v
+                k_buffer_layers[il] = pool_alloc( overlap_k );
+                v_buffer_layers[il] = pool_alloc( overlap_k ); // it's the same amt of memory, 1024*overlap_v
                 ggml_backend_tensor_get(kv_self->k_l[il], k_buffer_layers[il], to_st_k, overlap_k );
                 for( size_t i=0; i<1024; i++ ) {
                     ggml_backend_tensor_get(kv_self->v_l[il], (void*)((char*)v_buffer_layers[il]+(overlap_v*i)), to_st_v+(p_size*i), overlap_v );
@@ -2603,6 +3670,35 @@ typedef struct system_timestamp {
     int year, month, day;
     int hour, min, second;
 
+    std::string to_readable(void)
+    {
+        std::string when = "";
+        int hr;
+        if( hour >= 12 ) hr = hour-12;
+        else hr = hour;
+
+        when.append(std::to_string(month+1));
+        when.append("/");
+        when.append(std::to_string(day));
+        when.append("/");
+        int yr;
+        if( year >= 100 )
+            yr = 1900 + year;
+        else
+            yr = year;
+        when.append(std::to_string(yr));
+
+        when.append(" at ");
+
+        when.append(std::to_string(hr));
+        if( min < 10 )
+            when.append(":0");
+        else
+            when.append(":");
+        when.append(std::to_string(min));
+        when.append(hour>=12?"pm":"am");
+        return when;
+    }
     std::string to_string(void)
     {
         std::string when = "time_";
@@ -2621,12 +3717,20 @@ typedef struct system_timestamp {
 
         return when;
     }
+    std::string to_quick(void)
+    {
+        std::string when = "";
+        when.append(std::to_string(min));
+        when.append("_");
+        when.append(std::to_string(second));
+        return when;
+    }
 } System_timestamp;
 System_timestamp *llama_ts_now()
 {
     std::time_t t = std::time(0);   // get time now
     std::tm* now = std::localtime(&t);
-    System_timestamp *ts = (System_timestamp*)myPool.alloc(sizeof(System_timestamp));
+    System_timestamp *ts = (System_timestamp*)pool_alloc(sizeof(System_timestamp));
 
     ts->year = now->tm_year;
     ts->month = now->tm_mon;
@@ -2642,7 +3746,7 @@ System_timestamp *llama_string_to_ts( std::string str )
     //chat_2024_3_22_15_18_46
     int ipos, npos;
     std::string conv;
-    System_timestamp *ts = (System_timestamp*)myPool.alloc(sizeof(System_timestamp));
+    System_timestamp *ts = (System_timestamp*)pool_alloc(sizeof(System_timestamp));
 
     ipos = str.find("_");
     ipos++;
@@ -2671,6 +3775,22 @@ System_timestamp *llama_string_to_ts( std::string str )
     ts->second = std::stoi( conv );
 
     return ts;
+}
+
+std::string quick_ts()
+{
+    System_timestamp *ts = llama_ts_now();
+    std::string res = ts->to_quick();
+    pool_free(ts);
+    return res;
+}
+
+std::string readable_ts()
+{
+    System_timestamp *ts = llama_ts_now();
+    std::string res = ts->to_readable();
+    pool_free(ts);
+    return res;
 }
 
 char toLowerCase(char c)
@@ -2704,6 +3824,7 @@ struct system_memory {
         new (&who) std::string;
         new (&keywords) std::set<std::string>;
         new (&tokens) std::vector<int>;
+        when = NULL;
         n_tokens=0;
     }
     void release()
@@ -2717,6 +3838,9 @@ struct system_memory {
         what = file.read_string();
         n_tokens = file.read_u16();
         std::string strWhen = file.read_string();
+
+        if( tokens.size() != 0 ) tokens.clear();
+        llama_quick_tokenize( what, tokens );
 
         when = llama_string_to_ts(strWhen);
 
@@ -2732,7 +3856,7 @@ struct system_memory {
         file.write_string(when->to_string());
     }
 
-    void build( std::string actor, std::string input)
+    void build( std::string actor, std::string input )
     {
         who = actor;
         when = llama_ts_now();
@@ -2740,6 +3864,7 @@ struct system_memory {
 
         if( tokens.size() != 0 ) tokens.clear();
         llama_quick_tokenize( what, tokens );
+        n_tokens = tokens.size();
 
         buildsearch();
     }
@@ -2750,7 +3875,7 @@ struct system_memory {
         wptr = word;
         *wptr = '\0';
 
-        LLAMA_LOG_INFO("%s: memory what=%s\n", __func__, what.c_str());
+        //LLAMA_LOG_INFO("%s: memory what=%s\n", __func__, what.c_str());
 
         int iptr, len = what.length();
         char c;
@@ -2813,14 +3938,17 @@ struct system_eidet {
         new (&what) std::string;
         new (&who) std::string;
         new (&keywords) std::set<std::string>;
+        when = NULL;
+        kbuf = NULL;
+        vbuf = NULL;
         n_tokens = 0;
     }
 
     void release()
     {
-        if( kbuf != NULL ) myPool.release(kbuf);
-        if( vbuf != NULL ) myPool.release(vbuf);
-        if( when != NULL ) myPool.release(when);
+        if( kbuf != NULL ) pool_free(kbuf);
+        if( vbuf != NULL ) pool_free(vbuf);
+        if( when != NULL ) pool_free(when);
         kbuf=NULL;
         vbuf=NULL;
         when=NULL;
@@ -2832,10 +3960,11 @@ struct system_eidet {
         what = file.read_string();
         std::string strWhen = file.read_string();
         when = llama_string_to_ts(strWhen);
+        //LLAMA_LOG_INFO("%s\neidet_read: n_tokens\n", strWhen.c_str());
         n_tokens = file.read_u16();
 
-        kbuf = (ggml_fp16_t*)myPool.alloc( 32*2048*n_tokens );
-        vbuf = (ggml_fp16_t*)myPool.alloc( 32*2048*n_tokens );
+        kbuf = (ggml_fp16_t*)pool_alloc( 32*2048*n_tokens );
+        vbuf = (ggml_fp16_t*)pool_alloc( 32*2048*n_tokens );
 
         file.read_raw( kbuf, 32*2048*n_tokens );
         file.read_raw( vbuf, 32*2048*n_tokens );
@@ -2846,24 +3975,70 @@ struct system_eidet {
         //file.write_u16(sign);
         file.write_string(who);
         file.write_string(what);
-        file.write_string(when->to_string());
+        std::string whenStr = when->to_string();
+        file.write_string(whenStr);
         file.write_u16(n_tokens);
+
+        //LLAMA_LOG_INFO("Writing eidet kbuf: %zu bytes for %u tokens (%s)\n", 32*2048*n_tokens, n_tokens, what.c_str());
         file.write_raw( kbuf, 32*2048*n_tokens );
         file.write_raw( vbuf, 32*2048*n_tokens );
     }
 
-    void build( llama_kv_cache *kv, std::string actor, std::string input, int start, int used_tokens)
+    void build( llama_kv_cache *kv, std::string actor, std::string input, uint16_t start, uint16_t used_tokens)
     {
         who = actor;
         what = input;
         when = llama_ts_now();
 
-        //LLAMA_LOG_INFO("build eidet: %d start +%d tokens\n", start, used_tokens);
-
         n_tokens = used_tokens; /// read in the used tokens:
-        kbuf = (ggml_fp16_t*)myPool.alloc( 32 * 2048 * n_tokens );
-        vbuf = (ggml_fp16_t*)myPool.alloc( 32 * 2048 * n_tokens );
-        kv->read( start, used_tokens, (void*)kbuf, (void*)vbuf);
+        LLAMA_LOG_INFO("build eidet: %u start +%u tokens\n%s\n", start, n_tokens, input.c_str());
+
+        kbuf = (ggml_fp16_t*)pool_alloc( 32 * 2048 * n_tokens );
+        vbuf = (ggml_fp16_t*)pool_alloc( 32 * 2048 * n_tokens );
+
+        kv->read( start, n_tokens, (void*)kbuf, (void*)vbuf);
+    }
+
+    void build2( llama_kv_cache *kv, std::string actor, std::string input, size_t startpt,
+                 std::vector<int> tokens,
+                 std::vector<ggml_fp16_t> kx[32], std::vector<ggml_fp16_t> vx[32])
+    {
+        who = actor;
+        what = input;
+        when = llama_ts_now();
+
+        //LLAMA_LOG_INFO("build2 eidet: %zu start +%zu tokens\n", startpt, tokens.size());
+
+        n_tokens = tokens.size(); /// read in the used tokens:
+        kbuf = (ggml_fp16_t*)pool_alloc( 32 * 2048 * n_tokens );
+        vbuf = (ggml_fp16_t*)pool_alloc( 32 * 2048 * n_tokens );
+        LLAMA_LOG_INFO("eidet %p: copy raw tokens * %u\n", this, n_tokens);
+
+        size_t bufptr;
+
+        size_t v = 2 * n_tokens;
+        size_t k = 1024 * v;
+
+        size_t st_t = 2048 * startpt;
+
+        size_t p, p_sz = 2 * n_tokens;
+        size_t st_v = startpt * 2;
+
+        size_t endpt = startpt+n_tokens;
+
+        LLAMA_LOG_INFO("%s: startpt %zu n_tokens %zu\n", __func__, startpt, n_tokens);
+
+        for( int il=0; il<32; il++ ) {
+            memcpy(kbuf+il*k, kx[il].data(), k );
+            //! explore: it might be faster for short generations to read all of v over again instead of per-token per-head
+            st_v = startpt * 2;
+            bufptr=0;
+            for( int t=startpt; t<endpt; t++, st_v += 2 ) {
+                for( int i=0, p=st_v; i<1024; i++, p += p_sz, bufptr += 2 ) {
+                    memcpy(vbuf+bufptr, vx[il].data()+p, 2 );
+                }
+            }
+        }
     }
 
     int write( Kv_cache *kv, int start )
@@ -2874,14 +4049,14 @@ struct system_eidet {
 
     System_memory *convert()
     {
-        System_memory *mem = (System_memory*)myPool.alloc(sizeof(System_memory));
+        System_memory *mem = (System_memory*)pool_alloc(sizeof(System_memory));
 
         new (mem) System_memory;
 
         mem->prepare();
         mem->who = who;
         mem->what = what;
-        mem->when = (System_timestamp*)myPool.alloc(sizeof(System_timestamp));
+        mem->when = (System_timestamp*)pool_alloc(sizeof(System_timestamp));
         memcpy( mem->when, when, sizeof(System_timestamp));
         mem->buildsearch();
 
@@ -2915,6 +4090,8 @@ typedef struct kv_mem {
         uint16_t type = !is_full ? 1 : 2;
         file.write_u16( type );
 
+        LLAMA_LOG_INFO("write memory type %u (%s)\n", type, type==1?m->what.c_str():e->what.c_str());
+
         if( is_full ) e->writefile(file);
         else m->writefile(file);
     }
@@ -2922,16 +4099,21 @@ typedef struct kv_mem {
     {
         uint16_t type = file.read_u16();
         first=last=0;
+        LLAMA_LOG_INFO("read memory type %u\n", type);
         if( type == 1 ) {
-            m = (System_memory*)myPool.alloc(sizeof(System_memory));
+            m = (System_memory*)pool_alloc(sizeof(System_memory));
             new (m) System_memory;
             m->prepare();
             m->readfile(file);
+            is_full = false;
+            is_active = false;
         } else if( type == 2 ) {
-            e = (System_eidet*)myPool.alloc(sizeof(System_eidet));
+            e = (System_eidet*)pool_alloc(sizeof(System_eidet));
             new (e) System_eidet;
             e->prepare();
             e->readfile(file);
+            is_full = true;
+            is_active = false;
         } else {
             LLAMA_LOG_INFO("%s: wrong type %d", __func__, type);
         }
@@ -2941,12 +4123,12 @@ typedef struct kv_mem {
     {
         if( m != NULL && release_contents ) {
             m->release();
-            myPool.release(m);
+            pool_free(m);
         }
         m=NULL;
         if( e != NULL && release_contents ) {
             e->release();
-            myPool.release(e);
+            pool_free(e);
         }
         e=NULL;
         is_active = is_full = false;
@@ -2974,7 +4156,7 @@ void llama_backup_file( const char *filepath )
     const char *ptr;
     int len = strlen(filepath), len2;
     for( ptr = filepath+len-1; ptr != filepath; ptr-- ) {
-        if( *ptr == '/' ) {
+        if( *ptr == '\\' ) {
             len2 = ptr-filepath;
             strncpy(parsed_path, filepath, len2);
             parsed_path[len2] = '\0';
@@ -2989,12 +4171,16 @@ void llama_backup_file( const char *filepath )
     }
 
     while(true) {
-        sprintf(fp2, "%s/%d_%s", parsed_path, backupno, parsed_fn);
+        sprintf(fp2, "%s\\%d_%s", parsed_path, backupno, parsed_fn);
         fp = fopen(fp2, "rb");
         if( !fp ) break;
         fclose(fp);
         backupno++;
     }
+
+    rename(filepath, fp2);
+
+    /*
 
     std::ifstream sourceFile(filepath, std::ios::binary);
     std::ofstream destinationFile(fp2, std::ios::binary);
@@ -3010,6 +4196,8 @@ void llama_backup_file( const char *filepath )
     sourceFile.close();
     destinationFile.close();
     LLAMA_LOG_INFO("%s: binary copy complete. (%s,%s)\n", __func__, filepath, fp2);
+    _unlink(filepath);
+    */
 }
 void loadmemories( const char *filepath, std::vector<Kv_mem*> &mems )
 {
@@ -3023,12 +4211,14 @@ void loadmemories( const char *filepath, std::vector<Kv_mem*> &mems )
         return;
     }
     uint32_t count;
+    LLAMA_LOG_INFO("%s: reading file %s\n", __func__, filepath);
     count = datafile.read_u32();
     LLAMA_LOG_INFO("%s: load %zu entries.\n", __func__, count);
     while( count > 0 ) {
         m = new_kv_mem();
         m->readfile(datafile);
         mems.push_back(m);
+        count--;
     }
 }
 void savememories( const char *filepath, std::vector<Kv_mem*> &mems )
@@ -3036,11 +4226,17 @@ void savememories( const char *filepath, std::vector<Kv_mem*> &mems )
     llama_file datafile(filepath, "wb");
     Kv_mem *m;
     std::vector<Kv_mem*>::iterator it;
+    uint32_t count = mems.size();
 
+    LLAMA_LOG_INFO("%s: writing file %s\n", __func__, filepath);
+    LLAMA_LOG_INFO("%s: save count:%zu entries.\n", __func__, count);
+    datafile.write_u32(count);
     for( it = mems.begin(); it != mems.end(); it++ ) {
         m = *it;
         m->writefile(datafile);
     }
+
+    datafile.close();
 }
 
 struct system_actor {
@@ -3056,6 +4252,9 @@ struct system_actor {
     std::vector<Kv_mem *> history; // things you have seen happen long ago (used for pulling RAG)
     std::vector<Kv_mem *> recent; // things you have seen happen recently
 
+    // idioms;
+    //
+
     std::unordered_map<std::string, Kv_mem*> keys;
 
     void prepare(void)
@@ -3065,6 +4264,8 @@ struct system_actor {
         new (&history) std::vector<Kv_mem *>; // things you have seen happen long ago (used for pulling RAG)
         new (&recent) std::vector<Kv_mem *>;
         new (&keys) std::unordered_map<std::string, Kv_mem*>;
+        new (&ragged) std::set<std::string>;
+        new (&name) std::string;
         mine=NULL;
         self=NULL;
         self_changed=rags_changed=mem_changed=false;
@@ -3108,23 +4309,26 @@ struct system_actor {
 
     void appendhist(Kv_mem *m)
     {
-        char *datapath = (char*) myPool.alloc(name.length() + 10);
+        char *datapath = (char*) pool_alloc(name.length() + 10);
         strcpy(datapath, "char\\");
         strcat(datapath, name.c_str());
         strcat(datapath, ".hst");
 
         llama_file datafile(datapath, "ab");
         m->writefile(datafile);
+        datafile.close();
     }
 
     Kv_mem *addrecent(System_eidet *m)
     {
+        LLAMA_LOG_INFO("Add recent eidet %s (%zu tokens)\n", m->what.c_str(), m->n_tokens);
         Kv_mem *mem = new_kv_mem(m);
         recent.push_back(mem);
         return mem;
     }
     Kv_mem *addrecent(System_memory *m)
     {
+        LLAMA_LOG_INFO("Add recent memory %s\n", m->what.c_str());
         Kv_mem *mem = new_kv_mem(m);
         recent.push_back(mem);
         return mem;
@@ -3153,25 +4357,26 @@ struct system_actor {
 
     void loadfile(void)
     {
-        char *rootpath = (char*) myPool.alloc(name.length() + 6);
+        LLAMA_LOG_INFO("%s: start\n", __func__);
+        char *rootpath = (char*) pool_alloc(name.length() + 6);
         strcpy(rootpath, "char\\");
         strcat(rootpath, name.c_str());
 
-        char *filepath = (char*) myPool.alloc(strlen(rootpath) + 5);
+        char *filepath = (char*) pool_alloc(strlen(rootpath) + 5);
         strcpy(filepath, rootpath);
         strcat(filepath, ".def");
-        char *ragpath = (char*) myPool.alloc(strlen(rootpath) + 5);
+        char *ragpath = (char*) pool_alloc(strlen(rootpath) + 5);
         strcpy(ragpath, rootpath);
         strcat(ragpath, ".rag");
-        char *mempath = (char*) myPool.alloc(strlen(rootpath) + 5);
+        char *mempath = (char*) pool_alloc(strlen(rootpath) + 5);
         strcpy(mempath, rootpath);
         strcat(mempath, ".mem");
-        char *hstpath = (char*) myPool.alloc(strlen(rootpath) + 5);
+        char *hstpath = (char*) pool_alloc(strlen(rootpath) + 5);
         strcpy(hstpath, rootpath);
         strcat(hstpath, ".hst");
-        char *rctpath = (char*) myPool.alloc(strlen(rootpath) + 5);
+        char *rctpath = (char*) pool_alloc(strlen(rootpath) + 5);
         strcpy(rctpath, rootpath);
-        strcat(rctpath, ".rct");
+        strcat(rctpath, ".rec");
 
         llama_file playerfile(filepath, "rb");
         Kv_mem *m;
@@ -3179,12 +4384,13 @@ struct system_actor {
         if( playerfile.fp != NULL ) {
             uint16_t self_found = playerfile.read_u16();
             if( self_found == 1 ) {
-                self = (System_eidet*)myPool.alloc(sizeof(System_eidet));
+                self = (System_eidet*)pool_alloc(sizeof(System_eidet));
                 new (self) System_eidet;
                 self->prepare();
                 self->readfile(playerfile);
                 mine = new_kv_mem(self);
             }
+            playerfile.close();
         }
 
         loadmemories(ragpath, rags);
@@ -3198,11 +4404,11 @@ struct system_actor {
     }
     void savefile()
     {
-        char *rootpath = (char*) myPool.alloc(name.length() + 6);
+        char *rootpath = (char*) pool_alloc(name.length() + 6);
         strcpy(rootpath, "char\\");
         strcat(rootpath, name.c_str());
 
-        char *filepath = (char*) myPool.alloc(strlen(rootpath) + 5);
+        char *filepath = (char*) pool_alloc(strlen(rootpath) + 5);
         strcpy(filepath, rootpath);
         strcat(filepath, ".def");
         llama_backup_file(filepath);
@@ -3214,25 +4420,33 @@ struct system_actor {
             datafile.write_u16(0);
         }
 
-        char *mempath = (char*) myPool.alloc(strlen(rootpath) + 5);
+        char *mempath = (char*) pool_alloc(strlen(rootpath) + 5);
         strcpy(mempath, rootpath);
         strcat(mempath, ".mem");
         llama_backup_file(mempath);
         savememories(mempath, mem);
 
-        char *ragpath = (char*) myPool.alloc(strlen(rootpath) + 5);
+        char *ragpath = (char*) pool_alloc(strlen(rootpath) + 5);
         strcpy(ragpath, rootpath);
         strcat(ragpath, ".rag");
         llama_backup_file(ragpath);
         savememories(ragpath, rags);
 
-        char *datapath = (char*) myPool.alloc(name.length() + 10);
+        char *datapath = (char*) pool_alloc(name.length() + 10);
         strcpy(datapath, "char\\");
         strcat(datapath, name.c_str());
         strcat(datapath, ".hst");
 
         llama_backup_file(datapath);
         savememories(datapath, history);
+
+        char *recpath = (char*) pool_alloc(name.length() + 10);
+        strcpy(recpath, "char\\");
+        strcat(recpath, name.c_str());
+        strcat(recpath, ".rec");
+
+        llama_backup_file(recpath);
+        savememories(recpath, recent);
     }
 
 
@@ -3244,8 +4458,8 @@ struct system_actor {
         std::vector<Kv_mem*> *res;
         uint16_t token=0;
 
-        //LLAMA_LOG_INFO("%s: build map 1\n", __func__);
-        res = (std::vector<Kv_mem*> *)myPool.alloc(sizeof(std::vector<Kv_mem*>));
+        LLAMA_LOG_INFO("%s(%s): build map 1\n", __func__, quick_ts().c_str());
+        res = (std::vector<Kv_mem*> *)pool_alloc(sizeof(std::vector<Kv_mem*>));
         new (res) std::vector<Kv_mem*>;
 
         if( mine ) {
@@ -3257,9 +4471,9 @@ struct system_actor {
             token = mine->e->n_tokens;
             if( mine->is_active && mine->first == me->first && mine->last == me->last ) {
                 me->is_active = true;
+                LLAMA_LOG_INFO("%s: mine is active\n", __func__);
             }
             res->push_back( me );
-            //LLAMA_LOG_INFO("set token after self=%zu\n", token);
         }
 
         for( it = mem.begin(); it != mem.end(); it++ ) {
@@ -3283,13 +4497,13 @@ struct system_actor {
             if( src->is_full ) {
                 me = new_kv_mem(src->e);
                 me->first = token;
-                me->last = token + me->e->n_tokens - 1;
-                token += me->e->n_tokens;
+                me->last = token + src->e->n_tokens - 1;
+                token += src->e->n_tokens;
             } else {
                 me = new_kv_mem(src->m);
                 me->first = token;
-                me->last = token + me->m->n_tokens - 1;
-                token += me->m->n_tokens;
+                me->last = token + src->m->n_tokens - 1;
+                token += src->m->n_tokens;
             }
             if( src->is_active && me->is_full && me->first == src->first ) {
                 me->is_active = true; // already written in this placement
@@ -3299,6 +4513,7 @@ struct system_actor {
             LLAMA_LOG_INFO("%s: add rag %zu-%zu\n", __func__, me->first, me->last);
         }
 
+        LLAMA_LOG_INFO("%s(%s): done\n", __func__, quick_ts().c_str());
         return res;
     }
 
@@ -3306,7 +4521,7 @@ struct system_actor {
     {
         Kv_mem *me, *src;
         uint16_t token = 0;
-        //LLAMA_LOG_INFO("%s: build map 2 use %zu\n", __func__, use_space);
+        LLAMA_LOG_INFO("%s(%s): build map 2 use %u\n", __func__, quick_ts().c_str(), use_space);
         if( res->size() > 0 ) {
             src = res->at( res->size()-1 );
             token = src->last+1;
@@ -3318,30 +4533,42 @@ struct system_actor {
 
         // insert history in reverse from end to beginning as far as we can go
         if( recent.size() > 0 ) {
-            LLAMA_LOG_INFO("Recent entries: %zu\n", recent.size());
+            LLAMA_LOG_INFO("Recent entries: %zu remnant token: %u\n", recent.size(), token_cpy);
         }
         for( it = recent.size()-1; it >= 0; it-- ) {
             src = recent[it];
 
-            if( token+src->e->n_tokens > use_space ) break;
-            token += src->e->n_tokens;
-            me = new_kv_mem(src->e);
+            if( src->is_full ) {
+                if( token+src->e->n_tokens > use_space ) break;
+                token += src->e->n_tokens;
+                me = new_kv_mem(src->e);
+            } else {
+                if( token+src->m->n_tokens > use_space ) break;
+                token += src->m->n_tokens;
+                me = new_kv_mem(src->m);
+            }
             new_to_old[me] = src;
             res->insert( res->begin()+itBoundary, me );
         }
+
         itBound2 = history.size();
         std::vector<System_memory*> *histcopy;
-        histcopy = (std::vector<System_memory*>*)myPool.alloc(sizeof(std::vector<System_memory*>));
+        histcopy = (std::vector<System_memory*>*)pool_alloc(sizeof(std::vector<System_memory*>));
         new (histcopy) std::vector<System_memory*>;
+
 
         if( it >= 0 )
             LLAMA_LOG_INFO("Move %d recent entries to history.\n", (it+1));
         while( it >= 0 ) { // move overflow to history
             src = recent[it];
-            me = new_kv_mem((System_memory*)myPool.alloc(sizeof(System_memory)));
+            me = new_kv_mem((System_memory*)pool_alloc(sizeof(System_memory)));
             new (me->m) System_memory;
             me->m->prepare();
-            me->m->build( src->e->who, src->e->what );
+            if( src->is_full ) {
+                me->m->build( src->e->who, src->e->what );
+            } else {
+                me->m->build( src->m->who, src->m->what );
+            }
             me->is_active = false;
             history.insert(history.begin() + itBound2, me);
             histcopy->insert(histcopy->begin(), me->m);
@@ -3350,20 +4577,28 @@ struct system_actor {
             it--;
         }
 
+        char buf[60];
         token = token_cpy; // final token count & organize results:
         for( it = itBoundary; it < res->size(); it++ ) {
             me = res->at(it);
             src = new_to_old.at(me);
 
             me->first = token;
-            token += me->e->n_tokens;
-            me->last = token - 1;
+            if( me->is_full )
+                token += src->e->n_tokens;
+            else
+                token += src->m->n_tokens;
+            me->last = token==0?0:token-1;
 
-            if( src->is_active && me->first == src->first ) {
+            strncpy(buf, me->e->what.c_str(), 50);
+            buf[ me->e->what.length() < 50 ? me->e->what.length() : 50 ] = '\0';
+            LLAMA_LOG_INFO("%s: set token start %u-end %u for %s message %s\n", __func__, me->first, me->last, me->is_full?"(full)":"(partial)", buf);
+
+            if( src->is_full && src->is_active && me->first == src->first ) {
                 me->is_active=true;
             }
         }
-        //LLAMA_LOG_INFO("%s: done\n", __func__);
+        LLAMA_LOG_INFO("%s(%s): done\n", __func__, quick_ts().c_str());
 
         return histcopy;
     }
@@ -3574,6 +4809,14 @@ struct system_kb {
     uint8_t current_kv;
     int16_t seq_mark[3] = {-1,-1,-1};
     int16_t gen_mark[3] = {-1,-1,-1};
+    int16_t gen_prev[3] = {0, 0, 0};
+    std::string gen_str_so_far[3];
+
+    /*
+    std::vector<int> gen_tokens_so_far[3];
+    std::vector<ggml_fp16_t> gen_k_so_far[3][32];
+    std::vector<ggml_fp16_t> gen_v_so_far[3][32];
+    */
 
     void prepare(void)
     {
@@ -3581,6 +4824,7 @@ struct system_kb {
         new (&players) std::unordered_map<std::string, System_actor*>;
         new (&ragwordmap) std::unordered_map<std::string, std::vector<Kv_mem*>> ;
         new (&active_actor) std::string;
+        active_actor = "System";
         new (&allmessages) std::vector<Kv_mem*>;
 
         for( int i=0; i<3; i++ ) {
@@ -3591,8 +4835,20 @@ struct system_kb {
             kvmap[i] = NULL;
             kvuser[i] = NULL;
             kv_ready[i] = false;
+            gen_mark[i] = seq_mark[i] = -1;
+            gen_prev[i] = 0;
+            new (&gen_str_so_far[i]) std::string;
+            gen_str_so_far[i] = "";
+            /*
+            for( int j=0; j<32; j++ ) {
+                new (&gen_k_so_far[i][j]) std::vector<ggml_fp16_t>;
+                new (&gen_v_so_far[i][j]) std::vector<ggml_fp16_t>;
+            }
+            new (&gen_tokens_so_far[i]) std::vector<int>;
+            */
         }
         new (&writinguser) std::string;
+
         writinguser = "";
         LLAMA_LOG_INFO("%s: prepared system_kb\n", __func__);
     }
@@ -3613,52 +4869,99 @@ struct system_kb {
     {
         writinguser = author;
         for( int i=0; i<3; i++ ) {
+            if( !kvuser[i] ) continue;
+            if( kvuser[i]->name != author ) continue;
+
             gen_mark[i] = seq_start[i];
+            gen_prev[i] = 0;
+            gen_str_so_far[i] = "";
+            LLAMA_LOG_INFO("set gen_mark[%d] to seq_start %u\n", i, seq_start[i]);
+            /*
+            for( int j=0; j<32; j++ ) {
+                gen_k_so_far[i][j].clear();
+                gen_v_so_far[i][j].clear();
+            }
+            gen_tokens_so_far[i].clear();
+            */
         }
     }
     void rewind_generation(std::string message, std::vector<int> &tokens)
     {
         // create memories:
         std::set<System_actor *> messaged;
-        if( tokens.size() == 0 )
-            llama_quick_tokenize( message, tokens );
-        for( int i=0; i<3; i++ ) {
-            if( !kv_ready[i] || !kvuser[i] ) {
+        Kv_mem *mem;
+        bool is_author;
+
+        LLAMA_LOG_INFO("%s: msg '%s', tokens %zu\n", __func__, message.c_str(), tokens.size());
+
+        for( int loop=0; loop<2; loop++ ) {
+            for( int i=0; i<3; i++ ) {
+                if( loop==0 && ( !kv_ready[i] || !kvuser[i] ) ) {
+                    gen_mark[i] = -1;
+                    gen_str_so_far[i] = "";
+                }
+                if( !kv_ready[i] || !kvuser[i] ) {
+                    continue;
+                }
+
+                is_author = ( writinguser == kvuser[i]->name );
+
+                if( loop == 0 && !is_author ) continue;
+                if( loop == 1 && is_author ) continue;
+
+                messaged.insert(kvuser[i]);
+                useactor(kvuser[i]->name);
+                tokens.clear();
+                if( is_author )
+                    llama_quick_tokenize(gen_str_so_far[i], tokens);
+                else
+                    llama_quick_tokenize(message, tokens);
+                LLAMA_LOG_INFO("%d(%s): msg '%s', scan '%s', tokens %zu\n", i, kvuser[i]->name.c_str(), message.c_str(), gen_str_so_far[i].c_str(), tokens.size());
+
+                if( kvuser[i]->name == writinguser ) {
+                    System_eidet *e = (System_eidet*)pool_alloc(sizeof(System_eidet));
+                    new (e) System_eidet;
+                    e->prepare();
+                    e->build(&(kv[i]), writinguser, gen_str_so_far[i], gen_mark[i], tokens.size());
+                    mem = kvuser[i]->addrecent(e);
+                    mem->first = gen_mark[i];
+                    mem->last = gen_mark[i] + tokens.size() - 1;
+                    mem->is_active = true;
+                } else {
+                    processtokens(writinguser, message, tokens, false, tokens.size());
+                    /*
+                    System_memory *m = (System_memory*)pool_alloc(sizeof(System_memory));
+                    new (m) System_memory;
+                    m->prepare();
+                    m->build(writinguser, message);
+                    mem = kvuser[i]->addrecent(m);
+                    processtokens_inplace(i, mem); //! todo: we may not need this.
+                    */
+                }
+                gen_str_so_far[i] = "";
                 gen_mark[i] = -1;
-                continue;
+                ragunmap(kvuser[i], message); // search for any ragged messages in the past
             }
-
-            Kv_mem *mem;
-            System_memory *m = (System_memory*)myPool.alloc(sizeof(System_memory));
-            new (m) System_memory;
-            m->prepare();
-            m->build(writinguser, message);
-
-            mem = kvuser[i]->addrecent(m);
-            mem->first = gen_mark[i];
-            mem->last = gen_mark[i] + tokens.size() - 1;
-            translate_inplace(i, kvuser[i], mem, tokens);
-            mem->is_active = true;
-            messaged.insert(kvuser[i]);
-
-            gen_mark[i] = -1;
         }
 
-        ragunmap(message); // search for any ragged messages in the past
+        //LLAMA_LOG_INFO("%s(%s): ragunmap\n", __func__, quick_ts().c_str());
 
+        //LLAMA_LOG_INFO("%s(%s): finish\n", __func__, quick_ts().c_str());
         std::vector<System_actor *>::iterator it;
         for( it = actors.begin(); it != actors.end(); it++ ) {
             if( messaged.contains( *it ) ) continue;
 
             System_actor *a = *it;
-            System_memory *m = (System_memory*)myPool.alloc(sizeof(System_memory));
+            System_memory *m = (System_memory*)pool_alloc(sizeof(System_memory));
             new (m) System_memory;
             m->prepare();
             m->build(writinguser, message);
+            LLAMA_LOG_INFO("store message for %s: %s\n", a->name.c_str(), message.c_str());
             a->addrecent(m);
         }
 
         writinguser = "";
+        LLAMA_LOG_INFO("%s(%s): done\n", __func__, quick_ts().c_str());
     }
     void query_actor_names(std::vector<std::string> &names)
     {
@@ -3676,7 +4979,7 @@ struct system_kb {
 
     Kv_mem *getmem(void)
     {
-        Kv_mem *memitem = (Kv_mem*)myPool.alloc(sizeof(Kv_mem));
+        Kv_mem *memitem = (Kv_mem*)pool_alloc(sizeof(Kv_mem));
         new (memitem) Kv_mem;
         memitem->prepare();
         allmessages.push_back(memitem);
@@ -3692,7 +4995,7 @@ struct system_kb {
             }
         }
         memitem->release(withmem);
-        myPool.release(memitem);
+        pool_free(memitem);
     }
     void freemems(std::set<Kv_mem *>items, bool withmem)
     {
@@ -3705,7 +5008,7 @@ struct system_kb {
                 allmessages.erase(allmessages.begin() + it);
                 it--;
                 memitem->release(withmem);
-                myPool.release(memitem);
+                pool_free(memitem);
             }
         }
     }
@@ -3743,7 +5046,7 @@ struct system_kb {
                     break;
                 }
             }
-            myPool.release(a);
+            pool_free(a);
         }
     }
 
@@ -3764,7 +5067,7 @@ struct system_kb {
                 for( itMap = kvmap[i]->begin(); itMap != kvmap[i]->end(); itMap++ ) {
                     eid = *itMap;
                     eid->release(false);
-                    myPool.release(eid);
+                    pool_free(eid);
                 }
                 delete kvmap[i];
                 kvmap[i] = NULL;
@@ -3775,7 +5078,7 @@ struct system_kb {
         for( itActor = actors.begin(); itActor != actors.end(); itActor++ ) {
             actor = *itActor;
             actor->release();
-            myPool.release(actor);
+            pool_free(actor);
         }
     }
 
@@ -3784,12 +5087,8 @@ struct system_kb {
         current_kv = kvno;
 
         if( !kvuser[kvno] ) {
-            if( kvno == 0 ) {
-                useactor("System");
-            } else {
-                LLAMA_LOG_INFO("usekv %d: no actor found!\n", kvno);
-                throw "Actor not resolved.";
-            }
+            LLAMA_LOG_INFO("usekv %d: no actor found!\n", kvno);
+            throw "Actor not resolved.";
         }
 
         //LLAMA_LOG_INFO("%s: use kv %d (actor %s)\n", __func__, kvno, kvuser[kvno]->name.c_str());
@@ -3847,7 +5146,7 @@ struct system_kb {
     {
         std::vector<Kv_mem*>::iterator it, it1, it2;
         Kv_mem *e1, *e2, *eid;
-        uint16_t n_tokens;
+        uint16_t n_tokens=0;
 
         std::vector<Kv_mem*> *prev = kvmap[kvno];
 
@@ -3856,22 +5155,7 @@ struct system_kb {
         // decide where everything goes (including partial memories)
         int token=0;
         if( map->size() > 0 )
-            LLAMA_LOG_INFO("%s: map kv(%d) has %d entries.\n", __func__, kvno, map->size());
-
-        /* this is done in build_map
-        for( it = map->begin(); it != map->end(); it++ ) {
-            eid = *it;
-            if( eid->first == 0 ) {
-                eid->first = token;
-                if( eid->e ) {
-                    eid->last = token + eid->e->n_tokens - 1;
-                } else {
-                    eid->last = token + eid->m->n_tokens - 1;
-                }
-            }
-            token = eid->last+1;
-        }
-        */
+            LLAMA_LOG_INFO("%s(%s): map kv(%d) has %d entries.\n", __func__, quick_ts().c_str(), kvno, map->size());
 
         std::set<Kv_mem*> movable;
         std::unordered_map<Kv_mem*, Kv_mem*> new_to_old;
@@ -3995,79 +5279,87 @@ struct system_kb {
                         llm.init();
                         initialized=true;
                     }
-                    llm.shuffle_kv( e1->first, 1+e1->last-e1->first, e1->first-eid->first );
-                    wrote=true;
+                    int delta = (int)eid->first - (int)e1->first;
+                    llm.shuffle_kv( e1->first, e1->last, delta );
                 }
-                n_tokens = n_tokens>=eid->last+1?n_tokens:eid->last+1;
             }
         }
-        if( initialized && wrote ) {
-            LLAMA_LOG_INFO("%s: run shuffler\n", __func__);
+        if( initialized ) {
             llm.run_kv_shuffler();
         }
         if( initialized ) {
-            LLAMA_LOG_INFO("%s: release shuffler\n", __func__);
+            LLAMA_LOG_INFO("%s(%s): release shuffler\n", __func__, quick_ts().c_str());
             llm.free();
         }
 
         // write unmovable memories
+        std::set<ggml_backend_t> backend_list;
+        wrote=false;
+        int entry_count=0;
         for( it = map->begin(); it != map->end(); it++ ) {
             eid = *it;
-            if( !eid->is_full || eid->is_active ) continue;
+            n_tokens = n_tokens>=eid->last+1?n_tokens:eid->last+1;
+
+            if( !eid->is_full ) continue;
+            if( eid->is_active ) {
+                int32_t len = eid->last - eid->first;
+                LLAMA_LOG_INFO("%s(%s): active @ %zu tokens %ld\n", __func__, quick_ts().c_str(), eid->first, len);
+                continue;
+            }
             if( !movable.contains(eid) || removed.contains(eid->e) ) {
+                if( !wrote ) {
+                    LLAMA_LOG_INFO("%s(%s): begin write\n", __func__, quick_ts().c_str());
+                    kv[kvno].prefit_clear();
+                    wrote=true;
+                }
                 eid->e->write(&(kv[kvno]), eid->first);
-                //LLAMA_LOG_INFO("%s: write complete\n", __func__);
-                n_tokens = n_tokens>=eid->last+1?n_tokens:eid->last+1;
-                wrote = true;
+                entry_count++;
             }
         }
-
+        if( wrote ) {
+            kv[kvno].prefit_write();
+            LLAMA_LOG_INFO("%s(%s): write complete, %d entries\n", __func__, quick_ts().c_str(), entry_count);
+        }
 
         // translate any partial memories into the kb
         bool writing_partial=false;
         for( it = map->begin(); it != map->end(); it++ ) {
             eid = *it;
+            n_tokens = n_tokens>=eid->last+1?n_tokens:eid->last+1;
             if( eid->is_full ) continue;
 
             if( !writing_partial ) {
-                LLAMA_LOG_INFO("%s: write partial memories\n", __func__);
-                writing_partial=true;
+                LLAMA_LOG_INFO("%s: partial memories found\n", __func__);
+                throw "Partial memories in recent\n";
+                //writing_partial=true;
             }
 
-            translate_inplace(kvno, kvuser[kvno], eid, eid->m->tokens);
-
-            // release the partial memory
-            eid->m->release();
-            myPool.release(eid->m);
-            eid->m = NULL;
+            //seq_start[kvno] = n_tokens;
+            //processtokens_inplace(kvno, eid);
         }
 
         if( finalize ) {
-            //LLAMA_LOG_INFO("%s: finalize (transfer map)\n", __func__);
+            LLAMA_LOG_INFO("%s(%s): finalize (transfer map)\n", __func__, quick_ts().c_str());
             kvmap[kvno] = map;
         }
         if( map->size() == 0 ) { // reset n_tokens... the previous methods skip over counting some entries
             n_tokens = 0;
         } else {
-            eid = *( map->begin() + map->size()-1 );
+            eid = map->at(map->size()-1);
             if( n_tokens != eid->last+1 ) {
-                LLAMA_LOG_INFO("[[[[[[%s: token count mismatch]]]]]]\n", __func__);
+                LLAMA_LOG_INFO("[[[[[[%s: token count mismatch: %zu expected %zu]]]]]]\n", __func__, n_tokens, eid->last+1);
             }
             n_tokens = eid->last+1;
         }
         seq_start[kvno] = kv[kvno].seq = current_context->seq_end = n_tokens;
-        //LLAMA_LOG_INFO("%s: done\n", __func__);
+        LLAMA_LOG_INFO("%s(%s): done, n_tokens=%u\n", __func__, quick_ts().c_str(), n_tokens);
     }
 
-    uint8_t useactor( std::string actorname )
+    uint8_t useactor( std::string actorname, bool quadruple_space=false )
     {
-        System_actor *a=NULL;
-        bool is_system_user=false;
-
-        is_system_user = ( actorname == "System" );
-
+        System_actor *a = getactor(actorname);
+        bool is_system_user = ( actorname == "System" );
         uint8_t tgt_kv;
-        a = getactor(actorname);
 
         if( is_system_user ) {
             tgt_kv=0;
@@ -4086,22 +5378,40 @@ struct system_kb {
             tgt_kv=2;
             kvuser[tgt_kv] = a;
         }
+        //if( current_kv == tgt_kv ) return seq_start[tgt_kv];
         LLAMA_LOG_INFO("%s: pick %s for %d\n", __func__, actorname.c_str(), tgt_kv);
 
-
-        uint16_t reserve_space=130;
+        uint16_t reserve_space=64;
         usekv(tgt_kv);
-        if( kv[tgt_kv].size <= 1024 )
-            reserve_space = 68;
 
         uint16_t use_space = kv[tgt_kv].size - reserve_space;
+        if( quadruple_space ) use_space -= 3*reserve_space;
+        use_space-=64; // extra tokens in case of additions or queries
+        uint16_t pad_space = 0;
+        System_eidet *pad_eidet=NULL;
 
         // generate a's map
-        //! Todo: maintain the map instead of building it every time we select an actor
+        // first we need to see how much space we're already using in the current gen
+        /* this way was too slow:
+        if( gen_mark[tgt_kv] != -1 && gen_mark[tgt_kv] != seq_start[tgt_kv] ) {
+            pad_space = ( seq_start[tgt_kv] - gen_mark[tgt_kv] );
+            use_space -= pad_space + 65; // speed up a little bit by providing extra space while generating long
+            // queries.
+            LLAMA_LOG_INFO("reserve space for %u: %u (%u) mark: %ld\n", tgt_kv, use_space, pad_space, gen_mark[tgt_kv]);
+        }
+        */
+        //! Todo: maintain the map itself instead of building it every time we select an actor
         std::vector<Kv_mem*> *eidmap = a->build_map1();
         usemap( tgt_kv, eidmap, false );
         std::vector<System_memory*> *new_histories = a->build_map2(use_space, eidmap);
         usemap( tgt_kv, eidmap, true );
+
+        /*if( pad_space > 0 && seq_start[tgt_kv] != gen_mark[tgt_kv] ) {
+            LLAMA_LOG_INFO("re-write reserve space [%u tokens]\n", pad_space);
+            gen_mark[tgt_kv] = seq_start[tgt_kv];
+            kv[tgt_kv].write2( gen_mark[tgt_kv], 0, pad_space, gen_k_so_far[tgt_kv], gen_v_so_far[tgt_kv]);
+            seq_start[tgt_kv] += pad_space;
+        }*/
 
         // add to ragwordmap if memories were cycled
         std::string srch;
@@ -4114,7 +5424,7 @@ struct system_kb {
                 if( ragwordmap.contains(srch) ) {
                     x = ragwordmap.at(srch);
                 } else {
-                    x = (std::vector<System_memory *>*)myPool.alloc(sizeof(std::vector<System_memory *>));
+                    x = (std::vector<System_memory *>*)pool_alloc(sizeof(std::vector<System_memory *>));
                     new (x) std::vector<System_memory *>;
                     ragwordmap[srch]=x;
                 }
@@ -4125,7 +5435,7 @@ struct system_kb {
         return tgt_kv;
     }
 
-    void ragunmap( std::string what )
+    void ragunmap( System_actor *a, std::string what )
     {
         std::unordered_map< std::string, std::vector<System_memory *> *> results;
         std::string *pstr;
@@ -4187,35 +5497,34 @@ struct system_kb {
                     highest = pair.first;
                 }
             }
+            if( highest_count <= 2 ) break;
             LLAMA_LOG_INFO("%s: unmap highest=%d\n", __func__, highest_count);
-            if( highest_count == 0 ) break;
             counts[highest] = 0;
             desired_adds--;
-            // add rag to actors' maps
-            // note we are adding to all actors, if in the future messages are sent to one actor and not
-            // another we will want to change that.
-            for( itAct = actors.begin(); itAct != actors.end(); itAct++ ) {
-                Kv_mem *memitem = getmem();
-                LLAMA_LOG_INFO("%s: unmap memory=%s\n", __func__, highest->what.c_str());
-                System_actor *a = *itAct;
-                if( a->ragged.contains(memitem->m->what) ) continue;
-                a->ragged.insert(memitem->m->what);
-                memitem->e = translate(*itAct, highest);
-                a->rags.push_back( memitem );
-                a->rags_changed = true;
+            // add rag to actor's map
+            Kv_mem *memitem = getmem();
+            LLAMA_LOG_INFO("%s: unmap memory=%s\n", __func__, highest->what.c_str());
+            if( a->ragged.contains(highest->what) ) continue;
+            a->ragged.insert(highest->what);
+            memitem->e = translate(highest);
+            memitem->m = NULL;
+            memitem->is_active = false;
+            memitem->is_full = true;
+            if( a->rags.size() > 2 ) {
+                a->rags.erase( a->rags.begin(), a->rags.begin()+a->rags.size()-2 );
             }
+            a->rags.push_back( memitem );
+            a->rags_changed = true;
         }
+
+        LLAMA_LOG_INFO("%s(%s): done\n", __func__, quick_ts().c_str());
     }
 
-    System_eidet *translate(System_actor *act, System_memory *mem)
+    System_eidet *translate(System_memory *mem)
     {
         std::vector<llama_token> tokens;
-
-        // load in the actor if not loaded
-        useactor(act->name);
-
         Kv_mem *newmem;
-        if( !(newmem=processtokens(mem->who, mem->what, tokens, false, 0)) )
+        if( !(newmem=processtokens(mem->who, mem->what, tokens, false, 0, true)) )
         {
             LLAMA_LOG_INFO("%s: failed to translate %s\n", __func__, mem->what.c_str());
             throw "Couldn't translate tokens\n";
@@ -4223,16 +5532,8 @@ struct system_kb {
 
         return newmem->e;
     }
-    void translate_inplace(uint8_t tgt_kv, System_actor *act, Kv_mem *mem, std::vector<int> &tokens)
-    {
-        if( !processtokens_inplace(tgt_kv, mem, tokens) )
-        {
-            LLAMA_LOG_INFO("%s: failed to translate %s\n", __func__, mem->m->what.c_str());
-            throw "Couldn't translate tokens\n";
-        }
-    }
 
-    // process_tokens sends a message to all agents
+    // send a message to all agents
     int process_tokens( std::string toname, std::string fromname, std::string message,
                         std::vector<llama_token> &tokens )
     {
@@ -4255,35 +5556,62 @@ struct system_kb {
 
         int batches = floor(ts_addit/64.0);
         int n_last_batch = ts_addit - 64 * batches;
-        LLAMA_LOG_INFO("%s: tokens=%d, additional=%d, rewind=%d\n", __func__, tokens.size(), ts_addit, ts_rewind);
+        LLAMA_LOG_INFO("%s: tokens=%d, additional=%d, rewind=%d to: %s\n", __func__, tokens.size(), ts_addit, ts_rewind, toname.c_str());
 
         if( toname != "all" ) {
             uint8_t tgt_kv;
-            tgt_kv = useactor(toname);
+            if( kvuser[current_kv]->name != toname )
+                useactor(toname);
             processtokens(fromname, message, tokens, false, ts_addit);
             return n_last_batch;
         }
-        uint8_t active_kv=0;
-
+        // likewise if we are generating we only use that kv
+        int genkv=99;
         for( int tgt=0; tgt<3; tgt++ ) {
-            if( kv_ready[tgt] && kvuser[tgt] ) {
-                //LLAMA_LOG_INFO("Send to %d\n", tgt);
-                seq_start[tgt] -= ts_rewind;
-                useactor(kvuser[tgt]->name);
-                processtokens(fromname, message, tokens, false, ts_addit); // fully process
-                messaged.insert( kvuser[tgt] );
+            if( kvuser[tgt] && gen_mark[tgt] != -1 ) {
+                genkv = tgt;
+                break;
             }
         }
 
-        // make sure the context has the active actor as the current kv cache
-        useactor(active_actor);
-        if( seq_mark[active_kv] != -1 || gen_mark[active_kv] != -1 ) {
+        for( int tgt=0; tgt<3; tgt++ ) {
+            if( genkv != 99 && genkv != tgt ) continue;
+
+            if( kvuser[tgt] ) {
+                //LLAMA_LOG_INFO("Send to %d\n", tgt);
+                seq_start[tgt] -= ts_rewind;
+                uint16_t seq_was = seq_start[tgt];
+                useactor(kvuser[tgt]->name);
+                processtokens(fromname, message, tokens, false, ts_addit); // fully process
+                // we want to add to a buffer if this is a gen_mark sequence
+                /* -- we do this in processtokens now
+                if( gen_mark[tgt] != -1 ) {
+                    // add ts_addit tokens to size
+                    LLAMA_LOG_INFO("%s: read ts_addit(%u) tokens after previous of %u\n", __func__, ts_addit, ts_prev);
+                    for( int j=0; j<32; j++ ) {
+                        gen_k_so_far[tgt][j].resize( gen_k_so_far[tgt][j].size() + ts_addit*1024 );
+                        gen_v_so_far[tgt][j].resize( gen_v_so_far[tgt][j].size() + ts_addit*1024 );
+                    }
+                    // read the tokens
+                    for( uint16_t k=0; k<ts_addit; k++ ) {
+                        gen_tokens_so_far[tgt].push_back( tokens[ts_prev+k] );
+                    }
+                    kv[tgt].read2( seq_was+ts_prev, ts_prev, ts_addit, gen_k_so_far[tgt], gen_v_so_far[tgt]);
+                    LLAMA_LOG_INFO("%s: done reading ts_addit\n", __func__);
+                }
+                */
+                messaged.insert( kvuser[tgt] );
+                if( gen_mark[tgt] != -1 )
+                    ragunmap(kvuser[tgt], message); // search for any ragged messages in the past
+            }
+        }
+
+        if( seq_mark[current_kv] != -1 || gen_mark[current_kv] != -1 ) {
             return n_last_batch; // Don't generate memories if we're going to rewind.
         }
 
         std::vector<System_actor*>::iterator it; // just say that we're sending it since they're not active yet
 
-        ragunmap(message); // search for any ragged messages in the past
 
         for( it = actors.begin(); it != actors.end(); it++ ) {
             if( messaged.contains( *it ) ) continue;
@@ -4291,10 +5619,11 @@ struct system_kb {
             a = *it;
             if( a->name == fromname ) continue;
 
-            System_memory *m = (System_memory*)myPool.alloc(sizeof(System_memory));
+            System_memory *m = (System_memory*)pool_alloc(sizeof(System_memory));
             new (m) System_memory;
             m->prepare();
             m->build(fromname, message);
+            LLAMA_LOG_INFO("store message for %s: %s\n", a->name.c_str(), message.c_str());
             a->addrecent(m);
         }
 
@@ -4302,27 +5631,42 @@ struct system_kb {
     }
 
     // processtokens sends a message to one (already-selected) agent
+
     Kv_mem *processtokens(std::string fromname, std::string message,
-                          std::vector<llama_token> &tokens, bool iskey=false, uint16_t ts_addit=0)
+                          std::vector<llama_token> &tokens, bool iskey=false, uint16_t ts_addit=0, bool force_encode=false)
     {
         size_t i;
         int n_batch = 64;
         uint16_t startpt;
+        uint16_t ts_prev = tokens.size();
+        Kv_mem *mem;
+        System_eidet *eid;
 
-        if( tokens.size() == 0 && ts_addit == 0 ) {
+        if( ts_prev == 0 && ts_addit == 0 ) {
             llama_quick_tokenize( message, tokens );
             ts_addit = tokens.size();
+
+            if( gen_mark[current_kv] != -1 )
+                gen_str_so_far[current_kv] = message;
+        } else {
+            ts_prev -= ts_addit;
+
+            if( gen_mark[current_kv] != -1 ) {
+                //LLAMA_LOG_INFO("%s gen: add string '%s'\n", __func__, message.c_str());
+                gen_str_so_far[current_kv].append(message);
+            }
         }
-/*
-        if( seq_start[tgt_kv] == 0 ) {
-            LLAMA_LOG_INFO("Add BOS(%d)\n", tgt_kv);
-            tokens.insert(tokens.begin()+1, 1);//add BOS for start
-        } */
 
         uint16_t tgt_kv = current_kv;
 
-        startpt = seq_start[tgt_kv];
-        for( i=tokens.size()-ts_addit; i < tokens.size(); i += n_batch ) {
+        if( gen_mark[tgt_kv] != -1 )
+            startpt = gen_mark[tgt_kv];
+        else
+            startpt = seq_start[tgt_kv];
+
+        LLAMA_LOG_INFO("%s(%u): start %u, process %u (bypass %u) of %zu tokens of %s(+%s)\n", __func__, tgt_kv, startpt, ts_addit, ts_prev, tokens.size(), gen_str_so_far[tgt_kv].c_str(), message.c_str());
+
+        for( i=ts_prev; i < tokens.size(); i += n_batch ) {
             size_t batch_end = std::min(i + n_batch, tokens.size());
             std::vector<int> teabatch(tokens.begin() + i, tokens.begin() + batch_end);
 
@@ -4333,70 +5677,30 @@ struct system_kb {
                 batch.token[k] = teabatch[k];
             }
 
-            current_context->sequential_start = current_context->seq_end = seq_start[tgt_kv] + tokens.size() - ts_addit;
-            int res = llama_decode(current_context, batch);
-            seq_start[tgt_kv] += batch.n_tokens;
+            if( seq_start[tgt_kv] + batch.n_tokens >= kv_extent[tgt_kv]-64 ) {
+                LLAMA_LOG_INFO("reserve_space from %u (limit %u)\n", seq_start[tgt_kv], kv_extent[tgt_kv]);
+                if( gen_mark[tgt_kv] != -1 ) {
+                    // add ts_addit tokens to size
+                    eid = (System_eidet*)pool_alloc(sizeof(System_eidet));
+                    new (eid) System_eidet;
+                    eid->prepare();
 
-            llama_batch_free(batch);
-        }
+                    // read from current_kv and build eidet
+                    eid->build(&(kv[tgt_kv]), fromname, message, gen_mark[tgt_kv], seq_start[tgt_kv]-gen_mark[tgt_kv]);
+                    // add to source
+                    mem = kvuser[tgt_kv]->addrecent(eid);
+                    mem->is_active = true;
 
-        if( seq_mark[tgt_kv] != -1 || gen_mark[tgt_kv] != -1 )
-            return NULL; // Don't generate memories if we're going to rewind.
-
-        Kv_mem *mem;
-        System_eidet *eid = (System_eidet*)myPool.alloc(sizeof(System_eidet));
-        new (eid) System_eidet;
-        eid->prepare();
-
-        // read from current_kv and build eidet
-        eid->build(&(kv[tgt_kv]), fromname, message, startpt, tokens.size());
-        // add to source
-        if( !iskey ) {
-            mem = kvuser[tgt_kv]->addrecent(eid);
-        } else {
-            mem = (Kv_mem*)myPool.alloc(sizeof(Kv_mem));
-            mem->prepare();
-            mem->is_full = true;
-            mem->m = NULL;
-            mem->e = eid;
-            mem->first = startpt;
-            mem->last = startpt+tokens.size()-1;
-        }
-        mem->is_active = true;
-
-        return mem;
-    }
-
-
-    // processtokens sends a message to one agent
-    bool processtokens_inplace(uint8_t tgt_kv, Kv_mem *mem, std::vector<llama_token> &tokens, bool iskey=false)
-    {
-        size_t i;
-        int n_batch = 64;
-        uint16_t startpt;
-
-        if( tokens.size() == 0 ) {
-            llama_quick_tokenize( mem->m->what, tokens );
-        }
-
-        LLAMA_LOG_INFO("%s: tgt_kv=%d from=%s first=%d last=%d n_tokens=%d tokens.size()=%d\nwhat=%s\n", __func__,
-                       tgt_kv, mem->m->who.c_str(), mem->first, mem->last, mem->m->n_tokens, tokens.size(), mem->m->what.c_str());
-        mem->m->n_tokens = tokens.size();
-
-        uint16_t record_ss = seq_start[tgt_kv];
-
-        startpt = seq_start[tgt_kv] = mem->first;
-        for( i=0; i < tokens.size(); i += n_batch ) {
-            size_t batch_end = std::min(i + n_batch, tokens.size());
-            std::vector<int> teabatch(tokens.begin() + i, tokens.begin() + batch_end);
-
-            llama_batch batch = llama_batch_init(teabatch.size(), 0, 1);
-            batch.n_tokens = teabatch.size();
-
-            for (int32_t k = 0; k < batch.n_tokens; k++) {
-                batch.token[k] = teabatch[k];
+                    LLAMA_LOG_INFO("%s: done reading ts_addit\n", __func__);
+                }
+                useactor( kvuser[tgt_kv]->name, true ); // this 'true' will allocate 256 tokens, enough for 4 batches.
+                startpt = seq_start[tgt_kv];
+                if( gen_mark[tgt_kv] != -1 ) { // reset gen mark after rebuilding map
+                    gen_mark[tgt_kv] = seq_start[tgt_kv];
+                }
+            } else {
+                //seq_start[tgt_kv] = startpt + tokens.size() - ts_addit;
             }
-
             current_context->sequential_start = current_context->seq_end = seq_start[tgt_kv];
             int res = llama_decode(current_context, batch);
             seq_start[tgt_kv] += batch.n_tokens;
@@ -4404,20 +5708,89 @@ struct system_kb {
             llama_batch_free(batch);
         }
 
-        seq_start[tgt_kv] = record_ss;
+        if( !force_encode && ( seq_mark[tgt_kv] != -1 || gen_mark[tgt_kv] != -1 ) ) {
+            //LLAMA_LOG_INFO("[skip adding to recent memories for %d]\n", tgt_kv);
+            return NULL; // Don't generate memories if we're going to rewind.
+        }
 
-        System_eidet *eid = (System_eidet*)myPool.alloc(sizeof(System_eidet));
+        eid = (System_eidet*)pool_alloc(sizeof(System_eidet));
         new (eid) System_eidet;
         eid->prepare();
 
         // read from current_kv and build eidet
-        eid->build(&(kv[tgt_kv]), mem->m->who, mem->m->what, startpt, tokens.size());
+        eid->build(&(kv[tgt_kv]), fromname, message, startpt, tokens.size());
         // add to source
-        mem->e = eid;
-        mem->last = mem->first + tokens.size() - 1;
-        mem->is_full = true;
+        if( !iskey && !force_encode ) {
+            mem = kvuser[tgt_kv]->addrecent(eid);
+        } else {
+            mem = (Kv_mem*)pool_alloc(sizeof(Kv_mem));
+            mem->prepare();
+            mem->is_full = true;
+            mem->is_active = true;
+            mem->m = NULL;
+            mem->e = eid;
+        }
+        mem->first = startpt;
+        mem->last = startpt+tokens.size()-1;
         mem->is_active = true;
 
+        return mem;
+    }
+
+
+    // processtokens sends a message to one agent
+    bool processtokens_inplace(uint8_t tgt_kv, Kv_mem *mem, bool iskey=false)
+    {
+        size_t i;
+        int n_batch = 64;
+
+        if( mem->m->tokens.size() == 0 ) {
+            llama_quick_tokenize( mem->m->what, mem->m->tokens );
+        }
+
+        mem->first = seq_start[tgt_kv];
+        mem->last = mem->first + mem->m->n_tokens - 1;
+        mem->m->n_tokens = mem->m->tokens.size();
+
+        LLAMA_LOG_INFO("%s: tgt_kv=%d from=%s first=%d tokens.size()=%u\nwhat=%s\n", __func__,
+                       tgt_kv, mem->m->who.c_str(), mem->first, mem->m->n_tokens, mem->m->what.c_str());
+
+        for( i=0; i < mem->m->tokens.size(); i += n_batch ) {
+            size_t batch_end = std::min(i + n_batch, mem->m->tokens.size());
+            std::vector<int> teabatch(mem->m->tokens.begin() + i, mem->m->tokens.begin() + batch_end);
+
+            llama_batch batch = llama_batch_init(teabatch.size(), 0, 1);
+            batch.n_tokens = teabatch.size();
+
+            for (int32_t k = 0; k < batch.n_tokens; k++) {
+                batch.token[k] = teabatch[k];
+            }
+
+            if( seq_start[tgt_kv] + batch.n_tokens >= kv_extent[tgt_kv] ) {
+                useactor( kvuser[tgt_kv]->name, true );
+            }
+            current_context->sequential_start = current_context->seq_end = seq_start[tgt_kv];
+            int res = llama_decode(current_context, batch);
+            seq_start[tgt_kv] += batch.n_tokens;
+
+            llama_batch_free(batch);
+        }
+
+        System_eidet *eid = (System_eidet*)pool_alloc(sizeof(System_eidet));
+        new (eid) System_eidet;
+        eid->prepare();
+
+        // read from current_kv and build eidet
+        eid->build(&(kv[tgt_kv]), mem->m->who, mem->m->what, mem->first, mem->m->n_tokens);
+        // add to source
+        mem->e = eid;
+        mem->is_full = true;
+        mem->m->release();
+        pool_free( mem->m );
+        mem->m = NULL;
+        mem->is_active = true;
+
+        LLAMA_LOG_INFO("%s(%s): done\n", __func__, quick_ts().c_str());
         return true;
     }
 
@@ -4427,15 +5800,15 @@ struct system_kb {
 
         if( players.count(who) <= 0 ) {
             // initialize actor
-            LLAMA_LOG_INFO("%s: prepare actor %s\n", __func__, who.c_str());
-            a = (System_actor*)myPool.alloc(sizeof(System_actor));
+            LLAMA_LOG_INFO("%s: prepare actor1 %s\n", __func__, who.c_str());
+            a = (System_actor*)pool_alloc(sizeof(System_actor));
             new (a) System_actor;
             a->prepare();
             a->name = who;
             a->loadfile();
             actors.push_back(a);
             players[who] = a;
-            LLAMA_LOG_INFO("%s: actor prepared\n", __func__);
+            LLAMA_LOG_INFO("%s: actor prepared3\n", __func__);
 
             // link the actor into the ragwordmap
             // add history to ragwordmap
@@ -4450,7 +5823,7 @@ struct system_kb {
                     if( ragwordmap.contains(srch) ) {
                         x = ragwordmap.at(srch);
                     } else {
-                        x = (std::vector<System_memory *>*)myPool.alloc(sizeof(std::vector<System_memory *>));
+                        x = (std::vector<System_memory *>*)pool_alloc(sizeof(std::vector<System_memory *>));
                         new (x) std::vector<System_memory *>;
                         ragwordmap[srch]=x;
                     }
@@ -4466,7 +5839,7 @@ struct system_kb {
     System_memory *remember( std::string actor, std::string who, std::string what, std::string when )
     {
         System_actor *a = current_kb->getactor(actor);
-        System_memory *m = (System_memory*)myPool.alloc(sizeof(System_memory));
+        System_memory *m = (System_memory*)pool_alloc(sizeof(System_memory));
         new (m) System_memory;
         m->prepare();
 
@@ -4567,6 +5940,7 @@ Kv_mem *new_kv_mem( void )
     m->m = NULL;
     m->e = NULL;
     m->is_full = false;
+    m->is_active = false;
     m->first = m->last = 0;
     return m;
 }
@@ -4576,6 +5950,7 @@ Kv_mem *new_kv_mem( System_memory *memory )
     m->m = memory;
     m->e = NULL;
     m->is_full = false;
+    m->is_active = false;
     m->first = m->last = 0;
     return m;
 }
@@ -5149,7 +6524,7 @@ struct llama_model_loader {
 
         ctx_gguf = gguf_init_from_file(fname.c_str(), params);
         if (!ctx_gguf) {
-            throw std::runtime_error(format("%s: failed to load model from %s\n", __func__, fname.c_str()));
+            throw std::runtime_error(format("%s: failed loading model from %s\n", __func__, fname.c_str()));
         }
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
@@ -10731,7 +12106,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     const auto & cparams = lctx.cparams;
     const auto & kv_self = lctx.kv_self;
 
-    llama_pos posn[256];
+    llama_pos posn[128];
 
     if (batch.token) {
         const int64_t n_tokens = batch.n_tokens;
@@ -10759,51 +12134,25 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     assert(ggml_backend_buffer_is_host(lctx.inp_KQ_mask->buffer));
 
     float * data = (float *) lctx.inp_KQ_mask->data;
-    float *pattern = (float*)myPool.alloc( n_kv * sizeof(float) );
+    float *pattern = (float*)pool_alloc( n_kv * sizeof(float) );
 
-    int i, t=0, skipcount=0;
+    int i;
     for( i=0; i<lctx.seq_end; i++ ) {
         pattern[i] = 0.0;
     }
     for( ; i<n_kv; i++ ) {
         pattern[i] = -INFINITY;
     }
-    /* old method using inuse flags
-        uint8_t x = kv_self->inuse[ t ];
-        if( x == 0xff ) {
-            for( int b=0; b<8 && (b+i) < n_kv; b++ ) {
-                if( i+b >= lctx.seq_end ) pattern[i+b] = -INFINITY;
-                else pattern[i+b] = 0.0;
-            }
-        } else if( x == 0 ) {
-            for( int b=0; b<8 && (b+i) < n_kv; b++ ) {
-                pattern[i+b] = -INFINITY;
-            }
-        } else {
-            for( int b=0; b<8 && (b+i) < n_kv; b++ ) {
-                if( i+b >= lctx.seq_end ) pattern[i+b] = -INFINITY;
-                else if( ((x>>(7-b))&1) == 1 ) {
-                    pattern[i+b] = 0.0;
-                } else {
-                    pattern[i+b] = -INFINITY;
-                    skipcount++;
-                }
-            }
-        }
-        t++;
-    }
-    if( skipcount > 12 ) {
-        //LLAMA_LOG_INFO("%s: Skip tokens: %d\n", __func__, skipcount);
-    }
-    */
 
     for (int j = 0; j < n_tokens; ++j) {
-        memcpy( data + (j * n_kv ), pattern, n_kv*sizeof(float) );
+        memcpy( data + (j*n_kv), pattern, n_kv*sizeof(float) );
+        memset( data + (j*n_kv)+lctx.seq_end, 0, (j+1)*sizeof(float) );
+        /*
         for( int jv = 0; jv <= j; jv++ ) {
             data[j*n_kv+lctx.seq_end+jv] = 0.0;
-        }
+        }*/
     }
-    myPool.release(pattern);
+    pool_free(pattern);
 }
 
 
@@ -10835,6 +12184,12 @@ const char *llama_idle( llama_context *ctx, const char **keyptr, const char **fm
     LLAMA_LOG_INFO("NULL %f\n", max_weight);
     */
     return NULL;
+}
+
+ggml_backend_t get_backend(ggml_tensor *x)
+{
+    ggml_backend_t backend_res = ggml_backend_sched_get_node_backend(current_context->sched, x);
+    return backend_res;
 }
 
 // decode a batch of tokens by evaluating the transformer
@@ -10891,7 +12246,7 @@ static int llama_decode_internal(
     const int64_t n_embd  = hparams.n_embd;
     const int64_t n_vocab = hparams.n_vocab;
 
-    //LLAMA_LOG_INFO("%s: kv_self %p (%p)\n", __func__, &lctx, lctx.sched);
+    LLAMA_LOG_INFO("%s: kv_self %p (%p)\n", __func__, &lctx, lctx.sched);
     ggml_backend_sched_reset(lctx.sched);
     ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
     //LLAMA_LOG_INFO("%s: kv_self\n", __func__);
@@ -10948,7 +12303,7 @@ static int llama_decode_internal(
     if (n_tokens >= 32 && hparams.n_expert == 0 && ggml_cpu_has_blas() && !ggml_cpu_has_gpublas()) {
         n_threads = std::min(4, n_threads);
     }
-    //LLAMA_LOG_INFO("%s: set inputs\n", __func__);
+    //LLAMA_LOG_INFO("%s: set inputs (%u)\n", __func__, n_tokens);
 
     llama_set_inputs(lctx, batch);
 
@@ -11019,11 +12374,11 @@ static int llama_decode_internal(
                         embd_out.resize(n_embd * 32);
                         ggml_backend_tensor_get_async(backend_embd, out_embds, embd_out.data(), 0, 32*n_embd*sizeof(float));
                     } else if( lctx.record_all == 1 ) {
-                        embd_out.resize(n_embd);
+                        embd_out.resize((n_embd*(n_tokens-1)));
                         ggml_backend_tensor_get_async(backend_embd, embd, embd_out.data(), (n_embd*(n_tokens-1))*sizeof(float), n_embd*sizeof(float));
                     } else {
                         embd_out.resize(n_embd);
-                        ggml_backend_tensor_get_async(backend_embd, embd, embd_out.data(), 0, n_embd*sizeof(float));
+                        ggml_backend_tensor_get_async(backend_embd, embd, embd_out.data(), (n_embd*(n_tokens-1))*sizeof(float), n_embd*sizeof(float));
                     }
                 } break;
             case LLAMA_POOLING_TYPE_CLS:
@@ -14820,6 +16175,7 @@ void llama_release_backend(struct llama_model &model, ggml_backend_t backend)
 
 void llama_pick_actor( std::string actorname )
 {
+    LLAMA_LOG_INFO("pickActor(%s)\n", actorname.c_str());
     current_kb->useactor( actorname );
     current_kb->active_actor = actorname; // decide who is responding with logits
 }
@@ -15205,7 +16561,7 @@ struct llama_context * llama_new_context_with_model(
     model->contexts.push_back(ctx);
     */
     ctx->ctx_ready = true;
-    current_kb = (System_kb*)myPool.alloc(sizeof(System_kb));
+    current_kb = (System_kb*)pool_alloc(sizeof(System_kb));
     new (current_kb)  System_kb;
     current_kb->prepare();
     LLAMA_LOG_INFO("Initializing KB.\n");
@@ -15920,24 +17276,26 @@ struct llama_batch llama_batch_get_one(
 struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_t n_seq_max) {
     llama_batch batch = { 0, nullptr, nullptr, 0, 0, 0 };
 
-    if (embd) {
-        batch.embd = (float *) myPool.alloc(sizeof(float) * n_tokens_alloc * embd);
+    if (embd != 0) {
+        batch.embd = (float *) pool_alloc(sizeof(float) * n_tokens_alloc * embd);
     } else {
-        batch.token = (llama_token *) myPool.alloc(sizeof(llama_token) * n_tokens_alloc);
+        batch.token = (llama_token *) pool_alloc(sizeof(llama_token) * n_tokens_alloc);
     }
 
     return batch;
 }
 
 void llama_batch_free(struct llama_batch batch) {
-    if (batch.token)    myPool.release(batch.token);
-    if (batch.embd)     myPool.release(batch.embd);
+    if (batch.token)    pool_free(batch.token);
+    if (batch.embd)     pool_free(batch.embd);
 }
 
 void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string key, std::string keyval )
 {
     System_kb *kv = current_kb;
     System_actor *a;
+    uint8_t tgt=99;
+    std::vector<llama_token> tokens;
 
     if( keyfor == "all" ) {
         std::vector<System_actor*>::iterator it;
@@ -15949,28 +17307,39 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
         return;
     }
 
-    if( !kv->players.contains(keyfor) ) {
-        if( key == "self" ) {
-            // create new actor with this self-key
-            LLAMA_LOG_INFO("%s: got self key for %s\n", __func__, keyfor.c_str());
-            current_kb->useactor(keyfor);
+    if( key == "self" ) {
+        if( !kv->players.contains(keyfor) ) {
+            LLAMA_LOG_INFO("%s: load player %s\n", __func__, keyfor.c_str());
+            tgt = kv->useactor(keyfor);
+            current_kb->active_actor = keyfor; // decide who is responding with logits
 
-            // set the self-key on that actor
-            // just continue llama_set_key(ctx, keyfor, "self", keyval);
+            std::string intro = "<|im_start|>System\nWelcome back. It is currently ";
+            intro.append(readable_ts());
+            intro.append(".<|im_end|>\n");
+
+            Kv_mem *mem = kv->processtokens("System", intro, tokens);
+            a = kv->players[ keyfor ];
+
+            LLAMA_LOG_INFO("%s: intro prepared for %s.\n", __func__, keyfor.c_str());
         } else {
             LLAMA_LOG_INFO("%s: not found player %s\n", __func__, keyfor.c_str());
             return;
         }
+    } else {
+        a = kv->players[ keyfor ];
     }
 
-    a = kv->players[ keyfor ];
-    std::vector<llama_token> tokens;
 
     // remove any old mem or self key that matches
     if( key == "self" ) {
+        // if it's the same keyval, don't process it we already have it.
+        if( a->self->what == keyval ) {
+            LLAMA_LOG_INFO("ignore duplicate key %s\n", key.c_str());
+            return;
+        }
         if( a->mine ) {
             a->mine->release();
-            myPool.release( a->mine );
+            pool_free( a->mine );
         }
     } else if( a->keys.contains(key) ) {
         Kv_mem *target = a->keys[key];
@@ -15979,324 +17348,32 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
         std::vector<Kv_mem *>::iterator it;
         for( it = a->mem.begin(); it != a->mem.end(); it++ ) {
             if( *it == target ) {
+                // if it's the same keyval, don't process it we already have it.
+                if( (*it)->e->what == keyval ) {
+                    LLAMA_LOG_INFO("ignore duplicate key %s\n", key.c_str());
+                    return;
+                }
                 a->mem.erase(it);
                 break;
             }
         }
 
         target->release();
-        myPool.release(target);
+        pool_free(target);
     }
 
     // process the tokens
-    uint8_t tgt = kv->useactor(a->name);
+    if( tgt == 99 )
+        tgt = kv->useactor(a->name);
+
     Kv_mem *mem = kv->processtokens(a->name, keyval, tokens, true, 0);
     if( key == "self" ) {
         a->self = mem->e;
         a->mine = mem;
-        current_kb->active_actor = a->name; // decide who is responding with logits
     } else {
         a->keys[key] = mem;
         kv->kvuser[tgt]->mem.push_back(mem);
     }
-
-    /*
-    llama_batch dummy;
-    dummy.n_tokens = 0;
-
-    llm_build_cb cb = [&](struct ggml_tensor * , const char * , int ) {
-    };
-
-    struct llm_build_context llm(*ctx, dummy, cb, false);
-    if( ctx->model.default_slots == NULL ) {
-        //LLAMA_LOG_INFO("%s: build slots\n", __func__);
-        ctx->model.default_slots = new std::unordered_map<std::string, _Slot*>();
-        for( int i=0; slot_labels[i].name.compare("><") != 0; i++ ) {
-            LLAMA_LOG_INFO("%s: build slot %s\n", __func__, slot_labels[i].name.c_str());
-            ctx->model.default_slots->insert({slot_labels[i].name, &slot_labels[i]});
-        }
-    }
-    if( ctx->current_keyed ) {
-        if( ctx->current_keyed->key.compare(newkey) == 0 ) return;
-
-        LLAMA_LOG_INFO("%s: save key %s\n", __func__, ctx->current_keyed->key.c_str());
-        llm.init();
-
-        // save previously keyed data to its slot
-        int newpos;
-        _Slot *s, *s2;
-        _Keyed *k, *k_first;
-        std::vector<_Keyed *> *sl, *sb;
-        std::vector<_Keyed *>::iterator si;
-        int latest_token=0, door;
-        bool changed=false, found=false, one;
-        int first_spot = -1, last_spot = 0;
-        int v;
-        std::string oldkey = ctx->current_keyed->key;
-
-        s = ctx->model.default_slots->at(oldkey);
-
-        if( !ctx->doors.contains(oldkey) ) {
-            //LLAMA_LOG_INFO("%s: new door\n", __func__);
-            int reserve_tokens;
-            int max_tok = s->max_tokens == 0 ? 4096 : s->max_tokens;
-
-            if( s->max_items == 1 ) reserve_tokens = max_tok;
-            else reserve_tokens = (int)floor( (float)max_tok / (float)(s->max_items) );
-
-            if( reserve_tokens > ctx->current_keyed->used_tokens ) {
-                reserve_tokens = ctx->current_keyed->used_tokens;
-            } else if( reserve_tokens < ctx->current_keyed->used_tokens ) {
-                int dist = ctx->current_keyed->limit(&ctx->kv_self, reserve_tokens);
-                if( dist != 0 && ctx->current_keyed->used_tokens + dist + ctx->current_keyed->start_pt == ctx->seq_end ) {
-                    ctx->seq_end = ctx->current_keyed->start_pt + ctx->current_keyed->used_tokens;
-                }
-            }
-
-            k_first=NULL;
-            for( auto it : ctx->locks ) {
-                k = it;
-                if( k->key.length() == 0 ) continue;
-                s2=ctx->model.default_slots->at(k->key);
-                if( s2 == NULL ) continue;
-                if( s2->orderno > s->orderno ) {
-                    v = k->start_pt;
-                    if( first_spot == -1 || v < first_spot ) {
-                        first_spot = v;
-                        k_first = k;
-                    }
-                }
-
-                door = k->start_pt + k->used_tokens;
-                if( door > latest_token ) latest_token = door;
-            }
-            if( first_spot == -1 ) first_spot = latest_token;
-            // make space
-            for( auto it : ctx->locks ) {
-                k = it;
-                if( k->key.length() == 0 ) continue;
-                v = k->start_pt;
-                if( v >= first_spot ) {
-                    one=k->moveTo( v + reserve_tokens );
-                    if( one ) changed=true;
-                    if( v+reserve_tokens+k->used_tokens > latest_token ) latest_token = v+reserve_tokens+k->used_tokens;
-                }
-            }
-
-            ctx->doors[oldkey] = first_spot;
-            //LLAMA_LOG_INFO("%s: placing key: %d\n", __func__, first_spot);
-            one = ctx->current_keyed->moveTo(first_spot);
-            if( one ) changed=true;
-
-            if( first_spot+ctx->current_keyed->used_tokens > latest_token ) latest_token = first_spot+ctx->current_keyed->used_tokens;
-            ctx->locks.insert( ctx->locks.end(), ctx->current_keyed );
-        } else {
-            //LLAMA_LOG_INFO("%s: old door\n", __func__);
-
-            int max_left = s->max_items;
-            int slotted_tokens = 0;
-
-            for( std::vector<_Keyed *>::iterator it = ctx->locks.begin(); it != ctx->locks.end(); it++ ) {
-                k = *it;
-                if( k->key.length() == 0 ) continue;
-
-                if( k->key.compare( ctx->current_keyed->key ) == 0 ) {
-                    slotted_tokens += k->used_tokens;
-                    if( s->can_merge ) { //! FIXME: requires more full understanding of expression.
-                        LLAMA_LOG_INFO("%s: writeme: merge\n", __func__);
-                        //k->merge(ctx->current_keyed->current, ctx->current_keyed->used_tokens);
-                        delete( ctx->current_keyed ); //!fixme: does it release current tokens
-                        ctx->current_keyed = NULL;
-                        k->write( ctx->kv_self );
-                        found = true;
-                        break;
-                    }
-                    v = k->start_pt;
-                    if( v < first_spot || first_spot < 0 ) {
-                        first_spot = v;
-                        si = it;
-                    }
-                    if( v + k->used_tokens > last_spot ) last_spot = k->used_tokens + v;
-                    max_left--;
-                }
-            }
-            if( !found ) {
-                door = first_spot;
-                if( max_left <= 0 ) {
-                    k_first=NULL;
-                    while( slotted_tokens+ctx->current_keyed->used_tokens > s->max_tokens ) {
-
-                        for( std::vector<_Keyed *>::iterator it = ctx->locks.begin(); it != ctx->locks.end(); it++ ) {
-                            k = *it;
-                            if( k->key.length() == 0 ) continue;
-
-                            if( k->key.compare( ctx->current_keyed->key ) == 0 ) {
-                                LLAMA_LOG_INFO("%s: shift first entry off\n", __func__);
-                                slotted_tokens -= k->used_tokens;
-                                k->blank( ctx->kv_self );
-                                ctx->locks.erase(si);
-                                delete( k );
-                                found=true;
-                                break;
-                            }
-                        }
-                        if( !found ) {
-                            LLAMA_LOG_INFO("%s: fixme\n", __func__);
-                            break;
-                        }
-
-                    }
-
-                    for( std::vector<_Keyed *>::iterator it = ctx->locks.begin(); it != ctx->locks.end(); it++ ) {
-                        k = *it;
-                        if( k->key.length() == 0 ) continue;
-
-                        if( k->key.compare( ctx->current_keyed->key ) == 0 ) {
-                            one = k->moveTo( first_spot );
-                            first_spot += k->used_tokens;
-                            changed=true;
-                        }
-                    }
-                    //LLAMA_LOG_INFO("%s: first_spot at %d, door at %d\n", __func__, first_spot, door);
-                } else {
-                    first_spot = last_spot; // this is where we will write
-                }
-
-                int needroom=0;
-                for( std::vector<_Keyed *>::iterator it = ctx->locks.begin(); it != ctx->locks.end(); it++ ) {
-                    k = *it;
-                    if( k->key.length() == 0 ) continue;
-                    //s2=ctx->model.default_slots->at(k->key);
-                    v = k->start_pt;
-                    if( v >= first_spot && v < first_spot+ctx->current_keyed->used_tokens ) {
-                        needroom=first_spot+ctx->current_keyed->used_tokens - v;
-                        LLAMA_LOG_INFO("%s: needroom=%d\n", __func__, needroom);
-                        break;
-                    }
-                }
-                if( needroom > 0 ) {
-                    for( std::vector<_Keyed *>::iterator it = ctx->locks.begin(); it != ctx->locks.end(); it++ ) {
-                        k = *it;
-                        v = k->start_pt;
-                        if( v >= first_spot ) {
-                            one = k->moveTo( v + needroom );
-                            if( one ) changed=true;
-                            if( v+needroom+k->used_tokens > latest_token )
-                                latest_token=v+needroom+k->used_tokens;
-                        }
-                    }
-                }
-
-                one = ctx->current_keyed->moveTo(first_spot);
-                if( one ) changed=true;
-
-
-                if( ctx->sequential_start == ctx->current_keyed->start_pt ) {
-                    ctx->seq_end = ctx->sequential_start = ctx->current_keyed->start_pt + ctx->current_keyed->used_tokens;
-                }
-
-                if( first_spot+ctx->current_keyed->used_tokens > latest_token )
-                    latest_token=first_spot+ctx->current_keyed->used_tokens;
-
-                ctx->locks.insert( ctx->locks.end(), ctx->current_keyed );
-            }
-        }
-        for( auto it : ctx->locks ) {
-            k = it;
-            if( k->delta==0 ) continue;
-            if( k->start_pt + k->used_tokens + k->delta > latest_token ) latest_token = k->start_pt + k->used_tokens;
-        }
-        if( latest_token > ctx->sequential_start ) {
-            if( ctx->sequential_start != ctx->current_keyed->start_pt ) {
-                int makespace = latest_token-ctx->sequential_start;
-                if( makespace < 100 ) makespace=100;
-                LLAMA_LOG_INFO("%s: shift old start %d->%d ++ %d\n", __func__, ctx->sequential_start, ctx->seq_end, makespace);
-                // seq_end may be affected by amnesia so we calculate the endpoint of the current input and assume there's nothing past that
-
-                // the current key buffer is embedded inside sequential_start -> seq_end so we remove it
-                uint16_t used_len = (ctx->seq_end - ctx->sequential_start) - ctx->current_keyed->used_tokens;
-                uint16_t space_created = llm.swap_left_kv_now(ctx->current_keyed->start_pt, ctx->current_keyed->used_tokens, ctx->current_keyed->start_pt, ctx->sequential_start, ctx->seq_end);
-                ctx->sequential_start += space_created;
-                ctx->seq_end = ctx->sequential_start + used_len;
-                llm.shuffle_kv_now( ctx->sequential_start, ctx->seq_end, makespace );
-                 // update sequencing input area pointers
-                ctx->sequential_start += makespace;
-                ctx->seq_end += makespace;
-
-                // we now have to adjust our key's pointer and delta
-                ctx->current_keyed->start_pt += makespace;
-                ctx->current_keyed->delta -= makespace;
-            } else {
-                ctx->seq_end = ctx->sequential_start = latest_token;
-            }
-        }
-        //LLAMA_LOG_INFO("%s: moving doors\n", __func__);
-        for( auto it : ctx->locks ) {
-            k = it;
-            k->back = NULL;
-            if( k->delta == 0 ) continue;
-            int ep = k->start_pt + k->used_tokens + k->delta;
-            int sp = k->start_pt + k->delta;
-            std::vector<_Keyed*>::iterator it2;
-            for( it2 = ctx->locks.begin(); it2 != ctx->locks.end(); ) {
-                if( it == *it2 ) {
-                    it2++;
-                    continue;
-                }
-                _Keyed *k2 = *it2;
-                if( ( (k2->start_pt>=sp) && (k2->start_pt<ep) ) || ( (k2->start_pt+k2->used_tokens>sp) && (k2->start_pt+k2->used_tokens<ep) ) ) {
-                    if( k2->back != NULL ) {
-                        LLAMA_LOG_ERROR("%s: invalid door configuration: cyclic movement to key %s %d+%d\n", __func__, k2->key.c_str(), k2->start_pt, k2->used_tokens);
-                        break;
-                    }
-                    if( k2->delta == 0 ) {
-                        LLAMA_LOG_ERROR("%s: invalid door configuration: invalid movement to key %s %d+%d\n", __func__, k2->key.c_str(), k2->start_pt, k2->used_tokens);
-                        break;
-                    }
-                    k2->back = k;
-                    k = k2;
-                    it2 = ctx->locks.begin();
-                    continue;
-                }
-                it2++;
-            }
-            while( k ) {
-                llm.shuffle_kv_now( k->start_pt, k->start_pt + k->used_tokens, k->delta );
-                k->start_pt += k->delta;
-                k->delta = 0;
-                _Keyed *oldk = k;
-                k = k->back;
-                oldk->back = NULL;
-            }
-        }
-        //LLAMA_LOG_INFO("%s: executing graph\n", __func__);
-        //llm.run_kv_shuffler();
-        llm.free();
-        ctx->current_keyed = NULL;
-        if( newkey.length() == 0 ) {
-            LLAMA_LOG_INFO("%s: saving key done\n", __func__);
-        }
-    }
-    if( newkey.length() != 0 ) {
-        LLAMA_LOG_INFO("%s: set key to %s\n", __func__, newkey.c_str());
-        if( !ctx->model.default_slots->contains(newkey) ) {
-            LLAMA_LOG_INFO("%s: key %s not found\n", __func__, newkey.c_str());
-        }
-        _Slot *s = ctx->model.default_slots->at(newkey);
-
-        int reserve_area = s->max_per_item;
-        if( reserve_area == 2048 || reserve_area == 0 ) reserve_area = s->max_items > 1 ? s->max_tokens/s->max_items : s->max_tokens;
-        if( reserve_area == 0 && 4096 - ctx->seq_end < 1024 ) {
-            reserve_area=1024;
-        }
-        llama_kv_cache_reserve( ctx, reserve_area );
-    }
-    ctx->key = newkey;
-
-
-    if( newkey.length() > 0 )
-        ctx->amnesia_start = ctx->seq_end;
-    */
 }
 
 void llama_kv_cache_shift_fwd( struct llama_context *ctx, int fwd)
@@ -16322,8 +17399,8 @@ void llama_kv_cache_shift_fwd( struct llama_context *ctx, int fwd)
 
     size_t buffer_sz = 2048*ctx->kv_self->size;
 
-    void *nd = myPool.alloc( moving_sz );
-    void *nd2 = myPool.alloc( empty_sz );
+    void *nd = pool_alloc( moving_sz );
+    void *nd2 = pool_alloc( empty_sz );
     ggml_fp16_t z = fp32_to_fp16(0);
     for( int i=0; i<empty_sz; i+=2 ) {
         memcpy((void*)((char*)nd2+i),&z,2);
@@ -16340,8 +17417,8 @@ void llama_kv_cache_shift_fwd( struct llama_context *ctx, int fwd)
             ggml_backend_tensor_set(ctx->kv_self->v_l[il], nd2, k + v, x );
         }
     }
-    myPool.release(nd2);
-    myPool.release(nd);
+    pool_free(nd2);
+    pool_free(nd);
 
     //ctx->kv_self->use_tokens(ctx->sequential_start, fwd, false);
     ctx->sequential_start += fwd;

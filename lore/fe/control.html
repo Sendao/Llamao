@@ -469,7 +469,7 @@ function recvMessage(user, content, cbid, npast)
     var i;
     console.log("recv", user, ",", content);
     if( typeof npast != 'undefined' ) {
-        var np = gE("npast");
+        /*var np = gE("npast");
         var found=false;
         console.log(np.children);
         for( i=0; i<np.children.length; i++ ) {
@@ -484,17 +484,20 @@ function recvMessage(user, content, cbid, npast)
             x.innerText = npast;
             x.setAttribute('artist', user);
             np.appendChild(x);
-        }
+        }*/
     }
     if( user.indexOf("(past)") != -1 ) return;
 
     var e = gE("textlog");
-    var x = 1;
+    var x = 1, z=0;
     var lc;
 
     for( x=1; x<=e.childNodes.length; x++ ) {
-        if( x >= 3 ) break;
         lc = e.childNodes[ e.childNodes.length-x ];
+        if( lc.hasAttribute('fromuser') ) {
+            z++;
+        }
+        if( z > 2 ) break;
         if( lc.getAttribute('fromuser') == user ) {
             if( content === 0 ) {
                 lc.setAttribute('fromuser', "+" + user);

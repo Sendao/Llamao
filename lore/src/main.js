@@ -1544,11 +1544,14 @@ async function windowMessage(winid, cmd, ...params) {
     }
     if( msg !== 0 )
         lastmsg = msg;
+    else {
+        console.log("[end-of-message]");
+    }
 
     await windows[winid].webContents.send(cmd, ...params);
     if( typeof msg == 'string' ) {
         if( msg.indexOf("<|im_end|>") >= 0 ) {
-            await windowMessage(winid, cmd, params[0], 0);
+            await windows[winid].webContents.send(cmd, params[0], 0);
         }
     }
 }
