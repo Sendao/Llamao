@@ -576,7 +576,6 @@ std::string LLModel::generateResponse2(PromptContext &promptCtx, std::string fro
             buf += std::string(str);
         }
         promptCtx.tokens.emplace_back( id );
-        buf += std::string(str);
 
         found = false;
         pbufstart = pbuf = buf.c_str();
