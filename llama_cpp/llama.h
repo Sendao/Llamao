@@ -646,7 +646,7 @@ extern "C" {
 
 
     LLAMA_API void *pool_alloc(size_t sz);
-    LLAMA_API void pool_free(void *ptr);
+    LLAMA_API void my_pool_free(void *ptr);
 
     //
     // Grammar

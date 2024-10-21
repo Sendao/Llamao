@@ -170,17 +170,11 @@ static const int kv_context = 1;
 std::string quick_ts();
 
 static void replace_all(std::string & s, const std::string & search, const std::string & replace) {
-    std::string result;
-    for (size_t pos = 0; ; pos += search.length()) {
-        auto new_pos = s.find(search, pos);
-        if (new_pos == std::string::npos) {
-            result += s.substr(pos, s.size() - pos);
-            break;
-        }
-        result += s.substr(pos, new_pos - pos) + replace;
-        pos = new_pos;
+    size_t new_pos=0;
+    while( (new_pos = s.find(search, new_pos)) != std::string::npos ) {
+        s.replace(new_pos, search.length(), replace);
+        new_pos += replace.length();
     }
-    s = std::move(result);
 }
 
 static bool is_float_close(float a, float b, float abs_tol) {
@@ -2905,8 +2899,15 @@ typedef struct llama_kv_cache {
 
         //LLAMA_LOG_INFO("prefit_set(%zu,%zu)\n", start, len);
 
+        z.start = start;
+        z.len = len;
+
+        it = lower_bound( pre->begin(), pre->end(), z, [](kv_data a, kv_data b) {
+                return a.start+a.len <= b.start;
+            });/*
+
         for( it = pre->begin(); it != pre->end(); it++ ) {
-            /*if( (*it).start + (*it).len == start ) {
+            / *if( (*it).start + (*it).len == start ) {
                 if( (*it).len + len > (*it).alloced ) {
                     size_t newlen = (*it).len + len;
                     if( newlen < 256000 ) newlen *= 2;
@@ -2928,25 +2929,24 @@ typedef struct llama_kv_cache {
                 //LLAMA_LOG_INFO("prefit_set done 1\n", start, len);
                 return;
             }*/
+        if( it != pre->end() ) {
             if( (*it).start > start ) {
                 z.start = start;
                 z.len = len;
                 z.ptr = data;
                 z.alloced = 0;
                 pre->insert(it, z);
-                //LLAMA_LOG_INFO("prefit_set done 2\n", start, len);
-                return;
             } else if( (*it).start + (*it).len > start ) {
                 LLAMA_LOG_INFO("prefit overflow 2!\n");
                 throw "prefit overthrow!\n";
             }
+        } else {
+            z.start = start;
+            z.len = len;
+            z.ptr = data;
+            z.alloced = 0;
+            pre->push_back(z);
         }
-        z.start = start;
-        z.len = len;
-        z.ptr = data;
-        z.alloced = 0;
-        pre->push_back(z);
-        //LLAMA_LOG_INFO("prefit_set done 3\n", start, len);
     }
 #define max_buflen 32767
     void prefit_write(void)
@@ -4488,7 +4488,7 @@ struct system_actor {
             token = me->last+1;
 
             res->push_back( me );
-            LLAMA_LOG_INFO("%s: add mem %zu-%zu\n", __func__, me->first, me->last);
+            LLAMA_LOG_INFO("%s: add mem %u-%u\n", __func__, me->first, me->last);
         }
 
         for( it = rags.begin(); it != rags.end(); it++ ) {
@@ -4497,20 +4497,20 @@ struct system_actor {
             if( src->is_full ) {
                 me = new_kv_mem(src->e);
                 me->first = token;
-                me->last = token + src->e->n_tokens - 1;
                 token += src->e->n_tokens;
+                me->last = token - 1;
             } else {
                 me = new_kv_mem(src->m);
                 me->first = token;
-                me->last = token + src->m->n_tokens - 1;
                 token += src->m->n_tokens;
+                me->last = token - 1;
             }
             if( src->is_active && me->is_full && me->first == src->first ) {
                 me->is_active = true; // already written in this placement
             }
 
             res->push_back( me );
-            LLAMA_LOG_INFO("%s: add rag %zu-%zu\n", __func__, me->first, me->last);
+            LLAMA_LOG_INFO("%s: add rag %u-%u [%s]\n", __func__, me->first, me->last, me->is_full ? "full" : "partial");
         }
 
         LLAMA_LOG_INFO("%s(%s): done\n", __func__, quick_ts().c_str());
@@ -4592,7 +4592,7 @@ struct system_actor {
 
             strncpy(buf, me->e->what.c_str(), 50);
             buf[ me->e->what.length() < 50 ? me->e->what.length() : 50 ] = '\0';
-            LLAMA_LOG_INFO("%s: set token start %u-end %u for %s message %s\n", __func__, me->first, me->last, me->is_full?"(full)":"(partial)", buf);
+            //LLAMA_LOG_INFO("%s: set token start %u-end %u for %s message %s\n", __func__, me->first, me->last, me->is_full?"(full)":"(partial)", buf);
 
             if( src->is_full && src->is_active && me->first == src->first ) {
                 me->is_active=true;
@@ -4940,7 +4940,9 @@ struct system_kb {
                 }
                 gen_str_so_far[i] = "";
                 gen_mark[i] = -1;
-                ragunmap(kvuser[i], message); // search for any ragged messages in the past
+
+                if( kvuser[i]->name != "System" )
+                    ragunmap(kvuser[i], message); // search for any ragged messages in the past
             }
         }
 
@@ -5303,7 +5305,7 @@ struct system_kb {
             if( !eid->is_full ) continue;
             if( eid->is_active ) {
                 int32_t len = eid->last - eid->first;
-                LLAMA_LOG_INFO("%s(%s): active @ %zu tokens %ld\n", __func__, quick_ts().c_str(), eid->first, len);
+                LLAMA_LOG_INFO("%s(%s): active @ %u tokens %ld\n", __func__, quick_ts().c_str(), eid->first, len);
                 continue;
             }
             if( !movable.contains(eid) || removed.contains(eid->e) ) {
@@ -5439,7 +5441,6 @@ struct system_kb {
     {
         std::unordered_map< std::string, std::vector<System_memory *> *> results;
         std::string *pstr;
-
         char word[128], *wptr;
         wptr = word;
         *wptr = '\0';
@@ -5476,29 +5477,33 @@ struct system_kb {
             *wptr='\0';
         }
 
-        std::unordered_map<System_memory *, int> counts;
+        std::unordered_map<System_memory *, float> counts;
         std::vector<System_memory *>::iterator it;
         for( const auto &pair : results ) {
             for( it = pair.second->begin(); it != pair.second->end(); it++ ) {
                 if( !(counts.contains(*it)) )
-                    counts[*it]=1;
+                    counts[*it] = 1.0;
                 else
-                    counts[*it] = counts[*it]+1;
+                    counts[*it] = counts[*it] + 1.0;
             }
         }
-        int desired_adds=2;
+        for( auto &pair : counts ) {
+            pair.second /= pair.first->what.length();
+        }
+        int desired_adds=1, desired_rags=2;
+        float min_match = 0.02;
         System_memory *highest;
         std::vector<System_actor *>::iterator itAct;
         while( desired_adds > 0 ) {
-            int highest_count=0;
+            float highest_count=0;
             for( const auto &pair : counts ) {
-                if( pair.second > highest_count ) {
+                if( pair.second > min_match && pair.second > highest_count ) {
                     highest_count = pair.second;
                     highest = pair.first;
                 }
             }
             if( highest_count <= 2 ) break;
-            LLAMA_LOG_INFO("%s: unmap highest=%d\n", __func__, highest_count);
+            LLAMA_LOG_INFO("%s: unmap highest=%f\n", __func__, highest_count);
             counts[highest] = 0;
             desired_adds--;
             // add rag to actor's map
@@ -5506,15 +5511,19 @@ struct system_kb {
             LLAMA_LOG_INFO("%s: unmap memory=%s\n", __func__, highest->what.c_str());
             if( a->ragged.contains(highest->what) ) continue;
             a->ragged.insert(highest->what);
-            memitem->e = translate(highest);
-            memitem->m = NULL;
+            //memitem->e = translate_rag(highest);
+            memitem->m = translate_rag_mem(highest);
             memitem->is_active = false;
-            memitem->is_full = true;
-            if( a->rags.size() > 2 ) {
+            memitem->is_full = false;
+            if( a->rags.size() >= desired_rags ) {
                 a->rags.erase( a->rags.begin(), a->rags.begin()+a->rags.size()-2 );
             }
             a->rags.push_back( memitem );
             a->rags_changed = true;
+        }
+
+        if( a->rags_changed ) {
+            useactor(a->name);
         }
 
         LLAMA_LOG_INFO("%s(%s): done\n", __func__, quick_ts().c_str());
@@ -5531,6 +5540,38 @@ struct system_kb {
         }
 
         return newmem->e;
+    }
+
+    System_eidet *translate_rag(System_memory *mem)
+    {
+        std::vector<llama_token> tokens;
+        Kv_mem *newmem;
+        std::string newversion = mem->what;
+
+        replace_all(newversion, "|im_", "|mem_");
+        std::string memlabel = "(memory)\n";
+        newversion.replace( newversion.find('\n'), 1, memlabel );
+
+        if( !(newmem=processtokens(mem->who, newversion, tokens, false, 0, true)) )
+        {
+            LLAMA_LOG_INFO("%s: failed to translate %s\n", __func__, mem->what.c_str());
+            throw "Couldn't translate tokens\n";
+        }
+
+        return newmem->e;
+    }
+    System_memory *translate_rag_mem(System_memory *mem)
+    {
+        std::string newversion = mem->what;
+
+        replace_all(newversion, "|im_", "|mem_");
+        newversion.replace( newversion.find('\n'), 1, "(memory)\n" );
+
+        System_memory *newmem = (System_memory*)pool_alloc( sizeof(System_memory) );
+        newmem->prepare();
+        newmem->build(mem->who, newversion);
+
+        return newmem;
     }
 
     // send a message to all agents
@@ -5582,26 +5623,9 @@ struct system_kb {
                 seq_start[tgt] -= ts_rewind;
                 uint16_t seq_was = seq_start[tgt];
                 useactor(kvuser[tgt]->name);
-                processtokens(fromname, message, tokens, false, ts_addit); // fully process
-                // we want to add to a buffer if this is a gen_mark sequence
-                /* -- we do this in processtokens now
-                if( gen_mark[tgt] != -1 ) {
-                    // add ts_addit tokens to size
-                    LLAMA_LOG_INFO("%s: read ts_addit(%u) tokens after previous of %u\n", __func__, ts_addit, ts_prev);
-                    for( int j=0; j<32; j++ ) {
-                        gen_k_so_far[tgt][j].resize( gen_k_so_far[tgt][j].size() + ts_addit*1024 );
-                        gen_v_so_far[tgt][j].resize( gen_v_so_far[tgt][j].size() + ts_addit*1024 );
-                    }
-                    // read the tokens
-                    for( uint16_t k=0; k<ts_addit; k++ ) {
-                        gen_tokens_so_far[tgt].push_back( tokens[ts_prev+k] );
-                    }
-                    kv[tgt].read2( seq_was+ts_prev, ts_prev, ts_addit, gen_k_so_far[tgt], gen_v_so_far[tgt]);
-                    LLAMA_LOG_INFO("%s: done reading ts_addit\n", __func__);
-                }
-                */
+                processtokens(fromname, message, tokens, false, ts_addit); // fully process message
                 messaged.insert( kvuser[tgt] );
-                if( gen_mark[tgt] != -1 )
+                if( gen_mark[tgt] == -1 && kvuser[tgt]->name != "System" )
                     ragunmap(kvuser[tgt], message); // search for any ragged messages in the past
             }
         }
@@ -5659,10 +5683,10 @@ struct system_kb {
 
         uint16_t tgt_kv = current_kv;
 
-        if( gen_mark[tgt_kv] != -1 )
+        /*if( gen_mark[tgt_kv] != -1 )
             startpt = gen_mark[tgt_kv];
         else
-            startpt = seq_start[tgt_kv];
+            (*/startpt = seq_start[tgt_kv];
 
         LLAMA_LOG_INFO("%s(%u): start %u, process %u (bypass %u) of %zu tokens of %s(+%s)\n", __func__, tgt_kv, startpt, ts_addit, ts_prev, tokens.size(), gen_str_so_far[tgt_kv].c_str(), message.c_str());
 
@@ -5677,7 +5701,7 @@ struct system_kb {
                 batch.token[k] = teabatch[k];
             }
 
-            if( seq_start[tgt_kv] + batch.n_tokens >= kv_extent[tgt_kv]-64 ) {
+            if( seq_start[tgt_kv] + batch.n_tokens >= kv_extent[tgt_kv]-4 ) {
                 LLAMA_LOG_INFO("reserve_space from %u (limit %u)\n", seq_start[tgt_kv], kv_extent[tgt_kv]);
                 if( gen_mark[tgt_kv] != -1 ) {
                     // add ts_addit tokens to size
@@ -17307,20 +17331,16 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
         return;
     }
 
+    bool firstLoad=false;
+
     if( key == "self" ) {
         if( !kv->players.contains(keyfor) ) {
             LLAMA_LOG_INFO("%s: load player %s\n", __func__, keyfor.c_str());
             tgt = kv->useactor(keyfor);
             current_kb->active_actor = keyfor; // decide who is responding with logits
-
-            std::string intro = "<|im_start|>System\nWelcome back. It is currently ";
-            intro.append(readable_ts());
-            intro.append(".<|im_end|>\n");
-
-            Kv_mem *mem = kv->processtokens("System", intro, tokens);
+            firstLoad = true;
             a = kv->players[ keyfor ];
-
-            LLAMA_LOG_INFO("%s: intro prepared for %s.\n", __func__, keyfor.c_str());
+            LLAMA_LOG_INFO("%s: finished loading player %s\n", __func__, keyfor.c_str());
         } else {
             LLAMA_LOG_INFO("%s: not found player %s\n", __func__, keyfor.c_str());
             return;
@@ -17329,17 +17349,17 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
         a = kv->players[ keyfor ];
     }
 
-
     // remove any old mem or self key that matches
     if( key == "self" ) {
         // if it's the same keyval, don't process it we already have it.
-        if( a->self->what == keyval ) {
+        if( a->self && a->self->what == keyval ) {
             LLAMA_LOG_INFO("ignore duplicate key %s\n", key.c_str());
             return;
         }
         if( a->mine ) {
             a->mine->release();
             pool_free( a->mine );
+            a->self = NULL;
         }
     } else if( a->keys.contains(key) ) {
         Kv_mem *target = a->keys[key];
@@ -17366,6 +17386,8 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
     if( tgt == 99 )
         tgt = kv->useactor(a->name);
 
+
+    LLAMA_LOG_INFO("processing tokens\n");
     Kv_mem *mem = kv->processtokens(a->name, keyval, tokens, true, 0);
     if( key == "self" ) {
         a->self = mem->e;
@@ -17373,6 +17395,19 @@ void llama_set_key( struct llama_context * ctx, std::string keyfor, std::string 
     } else {
         a->keys[key] = mem;
         kv->kvuser[tgt]->mem.push_back(mem);
+    }
+
+    LLAMA_LOG_INFO("starting intro\n");
+    if( firstLoad ) {
+        std::string intro = "<|im_start|>System\nWelcome back. It is currently ";
+        intro.append(readable_ts());
+        intro.append(".<|im_end|>\n");
+
+        tokens.clear();
+        Kv_mem *mem = kv->processtokens("System", intro, tokens);
+        a = kv->players[ keyfor ];
+
+        LLAMA_LOG_INFO("%s: intro prepared for %s.\n", __func__, keyfor.c_str());
     }
 }
 

@@ -83,7 +83,7 @@ int LLModel::selectAnswer( std::string actor, std::string query, PromptContext &
     markRewind();
     int n_last_batch = decodePrompt2("System", actor, formed);
     std::cerr << "selectAnswer decode complete\n";
-    int ires = generateResponse3(pctx, "System", actor, n_last_batch, answers);
+    int ires = generateResponse3(pctx, actor, actor, n_last_batch, answers);
     std::cerr << "selectAnswer generate complete\n";
     rewindToMark();
 
@@ -107,11 +107,53 @@ std::string LLModel::queryActor( std::string actor, std::string query, PromptCon
     markRewind();
     int n_last_batch = decodePrompt2("System", actor, formed);
     std::cerr << "queryActor decode complete\n";
-    std::string res = generateResponse2(pctx, "System", actor, n_last_batch);
+    std::string res = generateResponse2(pctx, actor, actor, n_last_batch, NULL);
     std::cerr << "queryActor generate complete: " + res + "\n";
     rewindToMark();
 
     return res;
+}
+
+void LLModel::runQuery( std::string who, std::string key, std::string query, std::string frame,
+                        PromptContext &parentCtx,
+                        std::function<bool(int32_t, const std::string&, int, int, float *, float *)> responseCallback,
+                        bool forgetAboutIt
+                       )
+{
+    std::string formed = "<|im_start|>System\n" + query + "<|im_end|><|im_start|>" + who + "\n";
+    PromptContext pctx;
+    pctx.n_batch = 64;
+    pctx.n_last_batch_tokens = 0;
+    pctx.min_p = parentCtx.min_p;
+    pctx.repeat_last_n = 64;
+    pctx.top_k = parentCtx.top_k;
+    pctx.top_p = parentCtx.top_p;
+    pctx.temp = parentCtx.temp;
+    pctx.repeat_penalty = parentCtx.repeat_penalty;
+    pctx.contextErase = parentCtx.contextErase;
+
+    if( forgetAboutIt )
+        markRewind();
+
+    responseCallback(-1, formed, 0, 0, NULL, NULL);
+
+    markGeneration(who);
+    int n_last_batch = decodePrompt2("System", who, formed);
+    std::cerr << "queryActor decode complete\n";
+    std::string res = generateResponse2(pctx, who, who, n_last_batch, responseCallback);
+    std::vector<int> tokens;
+    rewindGeneration(res, tokens);
+
+    std::cerr << "queryActor generate complete: " + res + "\n";
+
+    if( forgetAboutIt )
+        rewindToMark();
+
+    if( key != "" ) {
+        setKey(who, key, res);
+    }
+
+    return;
 }
 
 void LLModel::prompt(const std::string &oldprompt,
@@ -143,6 +185,9 @@ void LLModel::prompt(const std::string &oldprompt,
     }
 
     std::string prompt=oldprompt;
+    std::vector<std::string>::iterator it;
+    std::string firstActorName;
+    std::vector<std::string> actorNames;
 
     if( prompt[0] == '&' ) { // for manual loading of old memories
         // loading old memories
@@ -190,6 +235,98 @@ void LLModel::prompt(const std::string &oldprompt,
         keyval = prompt.substr(linepos+1);
         setKey(keyfor, key, keyval);
 
+        return;
+    }
+
+    if( prompt[0] == '?' ) { // ?key[*actor][&framing]:query
+        std::string key = "";
+        std::string query = "";
+        std::string who = "";
+        std::string frame = "";
+
+        int seppos = prompt.find(":");
+        if( seppos == std::string::npos ) {
+            queryActorNames(actorNames);
+            for( it = actorNames.begin(); it != actorNames.end(); it++) {
+                if( *it == "System" ) continue;
+                who = *it;
+                break;
+            }
+            query = prompt.substr(1);
+            runQuery( who, "", query, "", promptCtx, responseCallback );
+            return;
+        }
+        int starpos = prompt.find("*");
+        int andpos = prompt.find("&");
+        if( andpos != std::string::npos ) {
+            frame = prompt.substr(andpos+1, seppos-1);
+            prompt = prompt.substr(0,andpos) + prompt.substr(seppos+1);
+        }
+        if( starpos > seppos || starpos == std::string::npos ) {
+            queryActorNames(actorNames);
+            for( it = actorNames.begin(); it != actorNames.end(); it++) {
+                if( *it == "System" ) continue;
+                who = *it;
+                break;
+            }
+        }
+        key = prompt.substr(1, seppos-1);
+        query = prompt.substr(seppos+1);
+
+        runQuery( who, key, query, frame, promptCtx, responseCallback );
+        return;
+    }
+
+    if( prompt[0] == '^' ) { // ^actor&framing:query || ^actor:query || ^&framing:query
+        std::string query = prompt.substr(1);
+        std::string who, frame="";
+
+        int seppos = prompt.find(":");
+        if( seppos == std::string::npos ) {
+            queryActorNames(actorNames);
+            for( it = actorNames.begin(); it != actorNames.end(); it++) {
+                if( *it == "System" ) continue;
+                who = *it;
+                break;
+            }
+            runQuery( who, "", query, "", promptCtx, responseCallback );
+            return;
+        }
+        int andpos = prompt.find("&");
+        if( andpos != std::string::npos ) {
+            frame = prompt.substr(andpos+1, seppos-1);
+            prompt = prompt.substr(0,andpos) + prompt.substr(seppos+1);
+        }
+        query = prompt.substr(seppos+1);
+
+        runQuery( who, "", query, frame, promptCtx, responseCallback);
+        return;
+    }
+
+    if( prompt[0] == '#' ) { // #actor&framing:query || ^actor:query || ^&framing:query
+        std::string query = prompt.substr(1);
+        std::string who, frame="";
+
+        int seppos = prompt.find(":");
+        if( seppos == std::string::npos ) {
+            queryActorNames(actorNames);
+            for( it = actorNames.begin(); it != actorNames.end(); it++) {
+                if( *it == "System" ) continue;
+                who = *it;
+                break;
+            }
+            query = prompt.substr(1);
+            runQuery( who, "", query, "", promptCtx, responseCallback );
+            return;
+        }
+        int andpos = prompt.find("&");
+        if( andpos != std::string::npos ) {
+            frame = prompt.substr(andpos+1, seppos-1);
+            prompt = prompt.substr(0,andpos) + prompt.substr(seppos+1);
+        }
+        query = prompt.substr(seppos+1);
+
+        runQuery( who, "", query, frame, promptCtx, responseCallback, false);
         return;
     }
 
@@ -264,11 +401,8 @@ void LLModel::prompt(const std::string &oldprompt,
     // decode the user prompt
 
     std::vector<int> tokens;
-    int n_last_batch = decodePrompt(promptCallback, responseCallback, promptCtx, fromname, toname, prompt, tokens);
+    int n_last_batch = decodePrompt2(fromname, toname, prompt);
 
-    std::cerr << "decodePrompt complete\n";
-
-    std::vector<std::string> actorNames;
     queryActorNames(actorNames);
     actorNames.push_back(fromname);
 
@@ -276,24 +410,33 @@ void LLModel::prompt(const std::string &oldprompt,
     std::string newprompt;
     std::string lastActor=fromname;
     while( true ) {
-        std::cerr << "pick actor...\n";
         tokens.clear();
-        iName = pickNextTalker(promptCtx, fromname, lastActor, actorNames);
-        //iName = selectAnswer("System", query, promptCtx, pollData, framing);
+        if( actorNames.size() == 3 ) { // there's only one actor to pick.
+            if( lastActor == fromname ) {
+                iName = 1;
+            } else {
+                iName = 2;
+            }
+        } else {
+            std::cerr << "pick actor...\n";
+            iName = pickNextTalker(promptCtx, fromname, lastActor, actorNames);
+            std::cerr << "pick actor " << toname << "\n";
+        }
         toname = actorNames[iName];
-        std::cerr << "pick actor " << toname << "\n";
         if( toname == fromname ) {
             std::cerr << "now it's the user's turn.\n";
             break;
         }
         std::string msgbuf = "<|im_start|>" + toname + "\n";
-        markGeneration(toname);
         tokens.clear();
-        decodePrompt(promptCallback, responseCallback, promptCtx, toname, "all", msgbuf, tokens);
+
+        markGeneration(toname);
+        decodePrompt2(toname, toname, msgbuf);
         // here we are generating the response so the toname is the same as the fromname.
         newprompt=generateResponse(responseCallback, promptCtx, toname, toname, n_last_batch, tokens);
         // rewind_generation will proceed with sending the message to 'all'.
         rewindGeneration(msgbuf + newprompt, tokens);
+
         lastActor=toname;
         std::cerr << "done [one line]\n";
     };
@@ -325,43 +468,30 @@ std::string LLModel::generateResponse(std::function<bool(int32_t, const std::str
     std::string end_literal = "<|im_end|>";
     std::string new_literal = "<|im_start|>";
     std::string fullResponse;
-    int i;
 
     // predict next tokens
     int32_t n_gen=promptCtx.n_predict;
     if( n_gen == 0 ) n_gen = 1024;
-    if( promptCtx.continuing ) {
-        n_gen = n_gen > promptCtx.per_idle ? promptCtx.per_idle : n_gen;
-    }
-
-    std::string buf = "";
-    std::string sstr;
-
+    std::string buf = "", prebuf = "";
     bool found;
-
     std::vector<int>::iterator it;
-    std::vector<std::string>::iterator sit;
-    std::vector<std::vector<float>>::iterator lit, eit;
-
-    int generatedTokens=0;
     bool ending=false;
     bool gen_new=false;
     bool finished_gen=false;
     std::string activename=fromname;
-    bool sendToAll=false;
-    const char *p1, *p2;
+    bool sendToAll;
+    const char *p1, *p2, *pbuf, *pbufstart;
+    uint16_t ptr;
 
-    if( toname == "all" ) {
-        sendToAll=true;
-    }
+    sendToAll = ( toname == "all" );
 
     std::cerr << "genResponse(" << fromname << ")\n";
     while( true ) {
-        //std::cerr << "tokens.size() = " << promptCtx.tokens.size() << "\n";
+        std::cerr << "tokens.size() = " << promptCtx.tokens.size() << "\n";
         feedData( promptCtx.logits, promptCtx.embds );
         auto id = sampleToken(promptCtx, n_last_batch);
         const std::string str = tokenToString(id);
-        std::cerr << "gen: " << str << "(" << id << ")\n";
+
         if( (n_last_batch=evalTokens(str, tokens, activename, toname)) == 0 ) {
             std::cerr << implementation().modelType() << " ERROR: Failed to predict next token\n";
             id = 32000; // end
@@ -374,15 +504,31 @@ std::string LLModel::generateResponse(std::function<bool(int32_t, const std::str
         auto membd = promptCtx.embds;
 
         found = false;
-        for( p1 = end_literal.c_str(), p2 = buf.c_str(); *p1 && *p2; p2++ ) {
+        pbufstart = pbuf = buf.c_str();
+        prebuf = "";
+        for( p1 = end_literal.c_str(), p2 = pbuf; *p1 && *p2; p2++ ) {
             if( *p1 == *p2 ) {
                 p1++;
-                found=true;
-            } else {
+                if( !found ) {
+                    found=true;
+                    pbuf = p2;
+                }
+            } else if( found ) {
                 found=false;
+                p1 = end_literal.c_str();
             }
         }
         if( found ) {
+            ptr = pbuf-pbufstart;
+            prebuf = buf.substr(0,ptr);
+            buf = buf.substr(ptr,buf.length()-ptr);
+            if( prebuf.length() > 0 ) {
+                if (!responseCallback(id, std::string(prebuf), mlogits.size(), membd.size(), mlogits.data(), membd.data())) {
+                    promptCtx.n_predict = 0;
+                    std::cerr << "Generation aborted by responseCallback.\n";
+                    break;
+                }
+            }
             if( buf.ends_with(end_literal) )
                 break;
             continue;
@@ -391,7 +537,6 @@ std::string LLModel::generateResponse(std::function<bool(int32_t, const std::str
         // share with cb
         if (!responseCallback(id, std::string(buf), mlogits.size(), membd.size(), mlogits.data(), membd.data())) {
             promptCtx.n_predict = 0;
-            i = 0;
             std::cerr << "Generation aborted by responseCallback.\n";
             break;
         }
@@ -400,17 +545,20 @@ std::string LLModel::generateResponse(std::function<bool(int32_t, const std::str
 
     return fullResponse;
 }
-std::string LLModel::generateResponse2(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch) {
+std::string LLModel::generateResponse2(PromptContext &promptCtx, std::string fromname, std::string toname,
+                            int n_last_batch,
+                            std::function<bool(int32_t, const std::string&, int, int, float *, float *)> responseCallback
+) {
     std::string end_literal = "<|im_end|>";
-    int i;
-    std::string buf = "";
+    std::string buf = "", prebuf = "";
     std::string res;
     std::vector<int>::iterator it;
-
-    int generatedTokens=0;
+    bool found;
+    const char *p1, *p2, *pbuf, *pbufstart;
+    uint16_t ptr;
     std::vector<int> newTokens;
 
-    std::cerr << "genResponse2()\n";
+    std::cerr << "genResponse2(" << fromname << "," << toname << ")\n";
     while( true ) {
         feedData( promptCtx.logits, promptCtx.embds );
         std::cerr << "sampleToken n_last_batch=" << n_last_batch << "\n";
@@ -428,15 +576,44 @@ std::string LLModel::generateResponse2(PromptContext &promptCtx, std::string fro
             buf += std::string(str);
         }
         promptCtx.tokens.emplace_back( id );
+        buf += std::string(str);
 
-        if( buf.find(end_literal) != std::string::npos ) {
+        found = false;
+        pbufstart = pbuf = buf.c_str();
+        prebuf = "";
+        for( p1 = end_literal.c_str(), p2 = pbuf; *p1 && *p2; p2++ ) {
+            if( *p1 == *p2 ) {
+                p1++;
+                if( !found ) {
+                    found=true;
+                    pbuf = p2;
+                }
+            } else if( found ) {
+                found=false;
+                p1 = end_literal.c_str();
+            }
+        }
+        if( found ) {
+            uint16_t ptr = pbuf-pbufstart;
+            prebuf = buf.substr(0,ptr);
+            buf = buf.substr(ptr,buf.length()-ptr);
+            if( prebuf.length() > 0 ) {
+                if ( responseCallback != NULL && !responseCallback(-1, std::string(prebuf), 0, 0, NULL, NULL) ) {
+                    std::cerr << "Generation aborted by responseCallback.\n";
+                    break;
+                }
+            }
+            if( buf.ends_with(end_literal) )
+                break;
+            continue;
+        }
+
+        // share with cb
+        if ( responseCallback != NULL && !responseCallback(-1, std::string(buf), 0, 0, NULL, NULL) ) {
+            std::cerr << "Generation aborted by responseCallback.\n";
             break;
         }
-        if( !end_literal.starts_with(buf) ) {
-            generatedTokens++;
-            res += buf;
-            buf = "";
-        }
+        buf = "";
     }
 
     return res;

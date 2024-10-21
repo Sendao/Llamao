@@ -212,11 +212,18 @@ protected:
         return true;
     }
 
-    int pickNextTalker(  PromptContext &parentCtx, std::string username, std::string lastTalker,
-                              std::vector<std::string> actorNames );
+    int pickNextTalker( PromptContext &parentCtx, std::string username, std::string lastTalker,
+                            std::vector<std::string> actorNames );
     int selectAnswer( std::string actor, std::string query, PromptContext &parentCtx,
-                              std::unordered_map<std::string, int> &answers, std::string framing );
+                            std::unordered_map<std::string, int> &answers, std::string framing );
     std::string queryActor( std::string actor, std::string query, PromptContext &parentCtx );
+
+    void runQuery( std::string who, std::string key, std::string query, std::string frame,
+                            PromptContext &parentCtx,
+                            std::function<bool(int32_t, const std::string&, int, int, float *, float *)> responseCallback,
+                            bool forgetAboutIt = true
+                           );
+
     int decodePrompt(std::function<bool(int32_t, int, int, float*, float*)> promptCallback,
                       std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
                       PromptContext &promptCtx,
@@ -230,7 +237,7 @@ protected:
     std::string generateResponse(std::function<bool(int32_t, const std::string&, int, int, float*, float*)> responseCallback,
                           PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch,
                           std::vector<int> &tokens);
-    std::string generateResponse2(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch);
+    std::string generateResponse2(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch, std::function<bool (int32_t, const std::string &, int, int, float *, float *)> responseCallback);
     int generateResponse3(PromptContext &promptCtx, std::string fromname, std::string toname, int n_last_batch,
                                    std::unordered_map< std::string, int > &answers);
 private:
